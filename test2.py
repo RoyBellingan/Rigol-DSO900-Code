@@ -76,22 +76,25 @@ y_increment = preamble[7]
 y_origin = preamble[8]  # This should be the voltage at the center of the screen
 y_reference = preamble[9]  # This is the reference value for scaling
 
-print(f"\nCorrected Waveform info:")
+print(f"\nWaveform scaling info:")
 print(f"Data points: {int(preamble[2])}")
 print(f"Sample rate: {1/x_increment:.1f} Hz")
 print(f"Time range: {x_increment * preamble[2]:.6f} seconds")
 print(f"Y increment: {y_increment:.6f} V")
-print(f"Y origin (center voltage): {y_origin:.6f} V")
+print(f"Y origin (from preamble): {y_origin:.6f} V")
 print(f"Y reference (scaling ref): {y_reference:.6f}")
 
-# The Y origin from preamble might be different from scope's vertical position
-# Let's check the actual scope vertical position
+# Get the actual scope vertical position settings
+scope_offset = 0.0
+scope_scale = 1.0
 try:
-    chan_offset = float(scope.query(":CHAN1:OFFS?").strip())
-    chan_scale = float(scope.query(":CHAN1:SCAL?").strip())
-    print(f"Channel offset: {chan_offset:.6f} V")
-    print(f"Channel scale: {chan_scale:.6f} V/div")
-    print(f"Expected center voltage: {-chan_offset:.6f} V")
+    scope_offset = float(scope.query(":CHAN1:OFFS?").strip())
+    scope_scale = float(scope.query(":CHAN1:SCAL?").strip())
+    print(f"Scope offset (vertical position): {scope_offset:.6f} V")
+    print(f"Scope scale: {scope_scale:.6f} V/div")
+    print(
+        f"Screen center represents: {-scope_offset:.6f} V (since you're shifted down by -2.1V)"
+    )
 except Exception as e:
     print(f"Could not read channel settings: {e}")
 
@@ -103,14 +106,26 @@ try:
 
     # Scale the data to time and voltage
     time_array = np.arange(len(data)) * x_increment + x_origin
-    voltage = (data - y_reference) * y_increment + y_origin
 
-    print("First 10 voltage values:")
-    for i in range(min(10, len(voltage))):
-        print(f"Point {i}: {voltage[i]:.6f} V")
+    # Option 1: Use preamble scaling (might be incorrect)
+    voltage_preamble = (data - y_reference) * y_increment + y_origin
+
+    # Option 2: Use scope offset for more accurate scaling
+    # The scope offset tells us what voltage the center of the screen represents
+    voltage_corrected = (data - 128) * (scope_scale * 10 / 256) - scope_offset
+
+    print("Scaling comparison:")
+    print("First 5 points:")
+    for i in range(min(5, len(data))):
+        print(
+            f"Point {i}: Raw={data[i]}, Preamble={voltage_preamble[i]:.6f}V, Corrected={voltage_corrected[i]:.6f}V"
+        )
+
+    # Use the corrected scaling based on scope settings
+    voltage = voltage_corrected
 
     # Save to CSV file
-    print("Saving data to CSV file...")
+    print("\nSaving data to CSV file using corrected scaling...")
     with open("waveform_data.csv", "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["Time (s)", "Voltage (V)"])
@@ -118,6 +133,7 @@ try:
             writer.writerow([t, v])
 
     print("Waveform data saved to waveform_data.csv")
+    print(f"Data range: {voltage.min():.6f}V to {voltage.max():.6f}V")
 
 except Exception as e:
     print(f"Error reading waveform data: {e}")
