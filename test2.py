@@ -139,5 +139,10 @@ except Exception as e:
     print(f"Error reading waveform data: {e}")
     print("Try increasing the timeout or checking scope settings")
 
+# Optional: grab all screenshots
+png = scope.query_binary_values(":DISP:DATA? PNG", datatype="B", container=bytes)
+with open("screenshot.png", "wb") as f:
+    f.write(png)
+
 scope.close()
 rm.close()
