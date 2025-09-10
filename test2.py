@@ -48,6 +48,9 @@ except:
 scope.write(":WAV:SOUR CHAN1")
 scope.write(":WAV:FORM BYTE")
 
+# Add this line to get all the captured data:
+scope.write(":WAV:MODE MAX")  # Change from NORMAL to MAXIMUM mode
+
 # Small delay to ensure scope is ready
 time.sleep(0.1)
 
