@@ -7,14 +7,28 @@ from datetime import datetime
 from io import StringIO
 import sys
 
+# Parse command line arguments for optional name and description
+name = ""
+description = ""
+
+if len(sys.argv) >= 2:
+    name = sys.argv[1]
+if len(sys.argv) >= 3:
+    description = sys.argv[2]
+
 # Create a folder with current date and time
 now = datetime.now()
-folder_name = now.strftime("run/%Y%m%d_%H%M%S")
+base_folder_name = now.strftime("%Y%m%d_%H%M%S")
+if name:
+    folder_name = f"run/{base_folder_name}_{name}"
+else:
+    folder_name = f"run/{base_folder_name}"
+
 os.makedirs("run", exist_ok=True)
 os.makedirs(folder_name, exist_ok=True)
 
 # Create a custom print function that also writes to file
-log_file_path = os.path.join(folder_name, "run_log.txt")
+log_file_path = os.path.join(folder_name, "log.txt")
 log_file = open(log_file_path, "w")
 
 
@@ -37,6 +51,10 @@ scope.timeout = 30000
 log_print(f"=== Oscilloscope Data Acquisition Run ===")
 log_print(f"Start time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 log_print(f"Data folder: {folder_name}")
+if name:
+    log_print(f"Run name: {name}")
+if description:
+    log_print(f"Description: {description}")
 log_print("")
 
 log_print(scope.query("*IDN?"))  # identify scope
