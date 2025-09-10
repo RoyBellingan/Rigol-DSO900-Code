@@ -92,9 +92,7 @@ try:
     scope_scale = float(scope.query(":CHAN1:SCAL?").strip())
     print(f"Scope offset (vertical position): {scope_offset:.6f} V")
     print(f"Scope scale: {scope_scale:.6f} V/div")
-    print(
-        f"Screen center represents: {-scope_offset:.6f} V (since you're shifted down by -2.1V)"
-    )
+    print(f"Screen center represents: {-scope_offset:.6f} V")
 except Exception as e:
     print(f"Could not read channel settings: {e}")
 
@@ -107,12 +105,11 @@ try:
     # Scale the data to time and voltage
     time_array = np.arange(len(data)) * x_increment + x_origin
 
-    # Option 1: Use preamble scaling (might be incorrect)
+    # Calculate voltage using preamble values for comparison
     voltage_preamble = (data - y_reference) * y_increment + y_origin
 
-    # Option 2: Use scope offset for more accurate scaling
-    # The scope offset tells us what voltage the center of the screen represents
-    voltage_corrected = (data - 128) * (scope_scale * 10 / 256) - scope_offset
+    # Use corrected scaling - try subtracting scope_offset instead of adding
+    voltage_corrected = (data - y_reference) * y_increment - scope_offset
 
     print("Scaling comparison:")
     print("First 5 points:")
