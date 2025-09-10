@@ -9,7 +9,8 @@ import sys
 
 # Create a folder with current date and time
 now = datetime.now()
-folder_name = now.strftime("%Y%m%d_%H%M%S")
+folder_name = now.strftime("run/%Y%m%d_%H%M%S")
+os.makedirs("run", exist_ok=True)
 os.makedirs(folder_name, exist_ok=True)
 
 # Create a custom print function that also writes to file
