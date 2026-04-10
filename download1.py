@@ -3,11 +3,15 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pyvisa
 
 IP = "192.168.1.162"                     # Scope IP
-CHANNELS = ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]   # Choose any subset: CHAN1..CHAN4
-OUT_PREFIX = "dho900"
+CHANNELS = [ "CHAN2","CHAN1", "CHAN3", "CHAN4"]   # Choose any subset: CHAN1..CHAN4
+OUT_PREFIX = ""
 OUT_DIR_PREFIX = "aq_"
 CHUNK_POINTS = 250_000                   # bytes per :WAV:DATA? (1 byte/point in BYTE mode)
 # After reading full memory, keep this many rows in CSV (evenly decimated over full span).
@@ -58,13 +62,47 @@ def acquire_memory_depth_points(scope) -> int:
     return int(float(raw))
 
 
+def _maximize_wav_poin(scope, channel: str, mdep: int) -> int:
+    """
+    Try to set :WAV:POIN to the largest value the scope will accept for this
+    channel.  The DHO800/900 rejects values above the per-channel limit and
+    falls back to a small default, so we probe downward from the overall MDEP
+    through the hardware-valid depths until one sticks.
+    """
+    # Probe list: memory_depth then the standard DHO900 depth values (descending)
+    candidates = sorted(
+        {mdep, 50_000_000, 25_000_000, 10_000_000, 5_000_000,
+         1_000_000, 100_000, 10_000, 1_000},
+        reverse=True,
+    )
+    for val in candidates:
+        if val <= 0:
+            continue
+        scope.write(f":WAV:POIN {val}")
+        check_scpi_errors(scope, f"WAV:POIN {val} {channel}", quiet=True)
+        accepted = int(float(scope.query(":WAV:POIN?").strip()))
+        if accepted >= val:
+            print(f"{channel}: :WAV:POIN {val} → accepted {accepted}")
+            return accepted
+        # The scope may cap instead of reject — still useful
+        if accepted > mdep // 2:
+            print(f"{channel}: :WAV:POIN {val} → capped to {accepted} (good enough)")
+            return accepted
+    # Last resort: whatever the scope has right now
+    accepted = int(float(scope.query(":WAV:POIN?").strip()))
+    print(f"{channel}: :WAV:POIN fallback → {accepted}")
+    return accepted
+
+
 def get_waveform_raw_byte(
-    scope, channel: str, requested_points: int, chunk_points: int = CHUNK_POINTS
+    scope, channel: str, acq_mdep_hint: int, chunk_points: int = CHUNK_POINTS
 ):
     """
-    Read full deep memory in RAW mode (same SCPI pattern as aq2.py).
-    Use :WAV:POIN + :WAV:POIN? — on DHO924S :WAV:POINts can disagree with the
-    resolved :ACQ:MDEP? depth. BYTE + IEEE block; voltage scaling from preamble.
+    Read full deep memory in RAW mode.
+
+    After selecting channel + RAW + BYTE we probe :WAV:POIN with decreasing
+    values to find the largest the scope accepts for this channel, then read
+    the preamble for the definitive point count.
     """
     scope.write(f":WAV:SOUR {channel}")
     check_scpi_errors(scope, f"WAV:SOUR {channel}")
@@ -72,11 +110,8 @@ def get_waveform_raw_byte(
     check_scpi_errors(scope, "WAV:MODE RAW")
     scope.write(":WAV:FORM BYTE")
     check_scpi_errors(scope, "WAV:FORM BYTE")
-    if requested_points > 0:
-        scope.write(f":WAV:POIN {requested_points}")
-        # WAV:POIN may fail if this channel has fewer points than requested
-        # (e.g. different ADC group). Drain the error and let preamble decide.
-        check_scpi_errors(scope, f"WAV:POIN {requested_points}", quiet=True)
+
+    _maximize_wav_poin(scope, channel, acq_mdep_hint)
 
     preamble = scope.query(":WAV:PRE?").strip()
     check_scpi_errors(scope, f"WAV:PRE? {channel}")
@@ -84,9 +119,12 @@ def get_waveform_raw_byte(
     if len(parts) < 10:
         raise RuntimeError(f"Unexpected preamble for {channel}: {preamble}")
 
-    # Always trust the preamble's point count — it reflects what the scope
-    # will actually deliver, even if WAV:POIN was rejected.
     points = int(float(parts[2]))
+    if acq_mdep_hint > 0:
+        print(
+            f"{channel}: :WAV:PRE? reports {points} RAW points "
+            f"(ACQ:MDEP? was {acq_mdep_hint}; they need not match — trust preamble)"
+        )
 
     xinc = float(parts[4])
     xorig = float(parts[5])
@@ -218,6 +256,85 @@ def save_decimated_csv(waveforms, ref_wf, prefix: str, out_dir: Path):
     print(f"Saved {filename}  ({len(idxs)} rows)")
 
 
+def _read_multichannel_csv(path: Path) -> tuple[list[str], list[float], dict[str, list[float]]]:
+    """Return (channel_names, times, voltages_by_channel) from aligned/decimated CSV."""
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        if len(header) < 3 or header[0] != "rowid" or header[1] != "time_s":
+            raise ValueError(f"Unexpected header in {path}: {header}")
+        ch_names = header[2:]
+        times: list[float] = []
+        cols: dict[str, list[float]] = {c: [] for c in ch_names}
+        for row in reader:
+            if len(row) < 2 + len(ch_names):
+                continue
+            times.append(float(row[1]))
+            for i, c in enumerate(ch_names):
+                cols[c].append(float(row[2 + i]))
+    return ch_names, times, cols
+
+
+def plot_aligned_vs_decimated(out_dir: Path, prefix: str, channels: list[str]) -> None:
+    """
+    One figure per channel: aligned trace (full resolution from file) plus decimated
+    points overlaid, so you can verify decimation matches the aligned data.
+    """
+    aligned_path = out_dir / f"{prefix}_aligned.csv"
+    decimated_path = out_dir / f"{prefix}_decimated.csv"
+    _, t_a, v_a = _read_multichannel_csv(aligned_path)
+    _, t_d, v_d = _read_multichannel_csv(decimated_path)
+
+    for ch in channels:
+        if ch not in v_a or ch not in v_d:
+            print(f"plot: skip {ch} (column missing in CSV)")
+            continue
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.plot(t_a, v_a[ch], color="C0", linewidth=0.6, alpha=0.85, label="aligned (file)")
+        ax.plot(
+            t_d,
+            v_d[ch],
+            color="C1",
+            linestyle="none",
+            marker=".",
+            markersize=3,
+            label="decimated (file)",
+        )
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel("voltage (V)")
+        ax.set_title(f"{ch}: aligned vs decimated")
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.35)
+        fig.tight_layout()
+        out_png = out_dir / f"{prefix}_{ch}_aligned_vs_decimated.png"
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+        print(f"Saved {out_png}")
+
+
+def plot_aligned_only(out_dir: Path, prefix: str, channels: list[str]) -> None:
+    """One figure per channel from {prefix}_aligned.csv only (no decimated overlay)."""
+    aligned_path = out_dir / f"{prefix}_aligned.csv"
+    _, t_a, v_a = _read_multichannel_csv(aligned_path)
+
+    for ch in channels:
+        if ch not in v_a:
+            print(f"plot: skip {ch} (column missing in {aligned_path})")
+            continue
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.plot(t_a, v_a[ch], color="C0", linewidth=0.6, alpha=0.85, label="aligned")
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel("voltage (V)")
+        ax.set_title(f"{ch}: aligned")
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.35)
+        fig.tight_layout()
+        out_png = out_dir / f"{prefix}_{ch}_aligned_only.png"
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+        print(f"Saved {out_png}")
+
+
 def validate_channels(channels):
     valid = {"CHAN1", "CHAN2", "CHAN3", "CHAN4"}
     bad = [ch for ch in channels if ch not in valid]
@@ -267,6 +384,7 @@ def main():
 
         save_aligned_csv(waveforms, ref_wf, OUT_PREFIX, out_dir)
         save_decimated_csv(waveforms, ref_wf, OUT_PREFIX, out_dir)
+        plot_aligned_vs_decimated(out_dir, OUT_PREFIX, CHANNELS)
     finally:
         scope.close()
         rm.close()
