@@ -1,47 +1,95 @@
 # DHO900
 
-Small Python utilities for **Rigol DHO900-series** oscilloscopes (for example DHO924S) on the LAN. They talk to the instrument over **VISA/SCPI** (TCP/IP), pull **deep waveform memory** in RAW mode, and write **CSV** files for analysis or plotting elsewhere.
+Python utility for downloading **deep-memory waveforms** from **Rigol DHO800/DHO900-series** oscilloscopes (tested on DHO924S) over the LAN via SCPI.
 
-## What it is for
+## What it does
 
-- Capture the full acquisition buffer from one or more channels after a stopped acquisition.
-- Export data as:
-  - one CSV per channel (`dho900_CHAN1.csv`, …),
-  - a time-aligned multi-channel file (`dho900_aligned.csv`),
-  - a downsampled file (`dho900_decimated.csv`) with a fixed maximum number of points.
+1. Connects to the scope over **VISA TCP/IP**.
+2. Stops the acquisition (`:STOP`).
+3. Reads every requested channel's full RAW buffer from internal memory.
+4. Exports:
+   - **Per-channel CSV** (`_CHAN1.csv`, ...) — every sample with absolute timestamps.
+   - **Aligned CSV** (`_aligned.csv`) — all channels at the shortest channel's sample count, shared time axis.
+   - **Decimated CSV** (`_decimated.csv`) — down-sampled to `OUTPUT_POINTS` rows.
+   - **Verification plots** (`_CHAN*_check.png`) — aligned trace with decimated dots overlaid for quick sanity-checking.
 
-The main script is **`download1.py`**. Other `.py` files in the repo are experiments or earlier variants (for example `aq2.py`); start with `download1.py` unless you know you need another script.
+All output goes to a timestamped folder (`aq_YYYY-MM-DD_HHMMSS/`).
 
 ## Requirements
 
 - **Python 3.10+** (3.11+ recommended).
-- Scope reachable on your network (Ethernet), with VISA **TCPIP** access enabled as in the Rigol manual.
-- Dependencies are listed in `requirements.txt` (`PyVISA`, `PyVISA-py`, `numpy`). The **`@py`** backend uses **PyVISA-py** so you do **not** need National Instruments VISA for typical TCP/IP use on Linux.
+- Scope on the LAN with VISA TCP access enabled.
+- Dependencies listed in `requirements.txt`:
 
-## Install (virtual environment)
-
-From the repository root:
-
-```bash
-cd /path/to/DHO900
-python3 -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install --upgrade pip
+```
 pip install -r requirements.txt
 ```
 
-## Configure and run
+The `@py` backend (PyVISA-py) is used — no National Instruments VISA needed on Linux.
 
-1. Edit **`download1.py`** at the top: set **`IP`** to your scope’s address, and **`CHANNELS`** to the subset you want (`CHAN1` … `CHAN4`). Optional: adjust **`CHUNK_POINTS`**, **`OUTPUT_POINTS`**, or **`OUT_PREFIX`** if needed.
-2. With the venv activated:
+## Quick start
 
-   ```bash
-   python download1.py
-   ```
+```bash
+# one-time setup
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-3. Output goes to a new folder named like **`YYYY-MM-DD_HHMMSS/`** in the current working directory, containing the CSV files described above.
+# edit config at the top of download1.py (IP, CHANNELS, etc.), then:
+python download1.py
+```
+
+## Configuration (top of `download1.py`)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `IP` | `192.168.1.162` | Scope IP address |
+| `CHANNELS` | `CHAN1`..`CHAN4` | Which channels to download |
+| `CHUNK_POINTS` | `250 000` | Samples per `:WAV:DATA?` request |
+| `OUTPUT_POINTS` | `10 000` | Row count for the decimated CSV |
+| `RESET_PAUSE` | `0.5` s | Pause between channel reads (see below) |
+
+## Known firmware quirk: WAV subsystem state leak
+
+The DHO800/DHO900 WAV read-back engine is **stateful across channel switches**.  After reading one channel in RAW mode, the internal state (pointers, POIN limit, buffer offsets) is **not** automatically reset.  If you simply switch `:WAV:SOUR` to the next channel, the scope silently returns a **truncated record** — often 1/4 or 1/10 of the real per-channel depth — with **no SCPI error**.
+
+### Symptoms
+
+- Channel read first gets the correct point count (e.g. 1 000 000).
+- Subsequent channels get far fewer points (e.g. 250 000, 100 000, or even 50 000).
+- Changing the channel order changes which channel is truncated.
+- `:WAV:POIN?` reports the reduced value as if it were the real depth.
+
+### Workaround (`_reset_wav_subsystem`)
+
+Before each channel read the script performs a full reinitialisation cycle:
+
+1. `:WAV:MODE NORMal` — flushes the RAW engine state.
+2. Reset `:WAV:STAR 1` / `:WAV:STOP 1000` — clears stale chunk pointers.
+3. `:WAV:SOUR CHANn` — select the new channel.
+4. `:WAV:MODE RAW` + `:WAV:FORM BYTE` — re-enter RAW read mode.
+5. `time.sleep(RESET_PAUSE)` — give the firmware time to settle.
+
+This was found empirically on **DHO924S firmware 00.01.02**.  If you still see truncation, increase `RESET_PAUSE` (try `1.0`).
+
+### Other things that do NOT work
+
+| Attempt | Result |
+|---|---|
+| Omit `:WAV:POIN` entirely | Scope uses a stale value; points vary unpredictably |
+| `:WAV:POIN 50000000` (max spec) | Scope rejects it and falls back to a small default (~50k) |
+| Probing `:WAV:POIN` with descending values | Each rejected write further corrupts the state |
 
 ## Troubleshooting
 
-- **Timeout or connection errors**: confirm IP, firewall, and that the scope accepts VISA TCP connections.
-- **SCPI errors** printed at runtime: the script reports the instrument’s error queue; check channel selection, memory depth, and that acquisition was in a state compatible with RAW readout after **`:STOP`**.
+- **Timeout / connection errors** — confirm IP, firewall, and that the scope accepts VISA TCP connections.
+- **SCPI errors at runtime** — the script drains and prints the error queue; check channel selection, memory depth, and acquisition state.
+- **Truncated channels** — increase `RESET_PAUSE` or power-cycle the scope.
+- **Very few unique voltage values** — this is normal for BYTE (8-bit) format when the signal spans a small fraction of the vertical scale.  Adjusting the V/div on the scope will improve ADC utilisation.
+
+## Other files
+
+| File | Purpose |
+|---|---|
+| `test2.py` | Earlier single-channel experiment |
+| `12bit check.py` | WORD-format (16-bit) feasibility test |
+| `scope_analyzer.cpp` | Offline C++ waveform analyser |
