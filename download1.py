@@ -62,36 +62,35 @@ def acquire_memory_depth_points(scope) -> int:
     return int(float(raw))
 
 
-def _maximize_wav_poin(scope, channel: str, mdep: int) -> int:
+RESET_PAUSE = 0.5          # seconds — let the scope settle between channels
+
+
+def _reset_wav_subsystem(scope, channel: str):
     """
-    Try to set :WAV:POIN to the largest value the scope will accept for this
-    channel.  The DHO800/900 rejects values above the per-channel limit and
-    falls back to a small default, so we probe downward from the overall MDEP
-    through the hardware-valid depths until one sticks.
+    Fully reinitialise the WAV read-back engine for *channel*.
+
+    The DHO800/900 keeps internal state from the previous RAW read that silently
+    limits the next channel's available point count.  Cycling through NORMal mode,
+    re-selecting the source, and resetting STAR/STOP clears that state.
     """
-    # Probe list: memory_depth then the standard DHO900 depth values (descending)
-    candidates = sorted(
-        {mdep, 50_000_000, 25_000_000, 10_000_000, 5_000_000,
-         1_000_000, 100_000, 10_000, 1_000},
-        reverse=True,
-    )
-    for val in candidates:
-        if val <= 0:
-            continue
-        scope.write(f":WAV:POIN {val}")
-        check_scpi_errors(scope, f"WAV:POIN {val} {channel}", quiet=True)
-        accepted = int(float(scope.query(":WAV:POIN?").strip()))
-        if accepted >= val:
-            print(f"{channel}: :WAV:POIN {val} → accepted {accepted}")
-            return accepted
-        # The scope may cap instead of reject — still useful
-        if accepted > mdep // 2:
-            print(f"{channel}: :WAV:POIN {val} → capped to {accepted} (good enough)")
-            return accepted
-    # Last resort: whatever the scope has right now
-    accepted = int(float(scope.query(":WAV:POIN?").strip()))
-    print(f"{channel}: :WAV:POIN fallback → {accepted}")
-    return accepted
+    import time
+
+    scope.write(":WAV:MODE NORMal")
+    check_scpi_errors(scope, "WAV:MODE NORMal (reset)", quiet=True)
+    scope.write(":WAV:STAR 1")
+    scope.write(":WAV:STOP 1000")
+    check_scpi_errors(scope, "WAV:STAR/STOP reset", quiet=True)
+
+    scope.write(f":WAV:SOUR {channel}")
+    check_scpi_errors(scope, f"WAV:SOUR {channel}")
+
+    scope.write(":WAV:MODE RAW")
+    check_scpi_errors(scope, "WAV:MODE RAW")
+    scope.write(":WAV:FORM BYTE")
+    check_scpi_errors(scope, "WAV:FORM BYTE")
+
+    time.sleep(RESET_PAUSE)
+    check_scpi_errors(scope, f"post-reset {channel}", quiet=True)
 
 
 def get_waveform_raw_byte(
@@ -100,18 +99,17 @@ def get_waveform_raw_byte(
     """
     Read full deep memory in RAW mode.
 
-    After selecting channel + RAW + BYTE we probe :WAV:POIN with decreasing
-    values to find the largest the scope accepts for this channel, then read
-    the preamble for the definitive point count.
+    Before each channel we fully reset the WAV subsystem (cycle NORMal → RAW,
+    reset STAR/STOP, pause) so the scope doesn't carry stale limits from the
+    previous channel read.  Then set :WAV:POIN to the reported memory depth and
+    read the preamble for the definitive count.
     """
-    scope.write(f":WAV:SOUR {channel}")
-    check_scpi_errors(scope, f"WAV:SOUR {channel}")
-    scope.write(":WAV:MODE RAW")
-    check_scpi_errors(scope, "WAV:MODE RAW")
-    scope.write(":WAV:FORM BYTE")
-    check_scpi_errors(scope, "WAV:FORM BYTE")
+    _reset_wav_subsystem(scope, channel)
 
-    _maximize_wav_poin(scope, channel, acq_mdep_hint)
+    scope.write(f":WAV:POIN {acq_mdep_hint}")
+    check_scpi_errors(scope, f"WAV:POIN {acq_mdep_hint} {channel}", quiet=True)
+    accepted = scope.query(":WAV:POIN?").strip()
+    print(f"{channel}: :WAV:POIN {acq_mdep_hint} → accepted {accepted}")
 
     preamble = scope.query(":WAV:PRE?").strip()
     check_scpi_errors(scope, f"WAV:PRE? {channel}")
