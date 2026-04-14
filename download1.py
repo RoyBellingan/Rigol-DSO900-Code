@@ -316,6 +316,21 @@ def _plot_aligned_vs_decimated(out_dir: Path, prefix: str,
         print(f"Saved {out_png}")
 
 
+# ── Screenshot ────────────────────────────────────────────────────────
+
+def _save_screenshot(scope, out_dir: Path, prefix: str):
+    """Download a PNG screenshot of the oscilloscope display via SCPI."""
+    print("Capturing screenshot...")
+    png = scope.query_binary_values(
+        ":DISP:DATA? PNG", datatype="B", container=bytes,
+    )
+    _check_scpi_errors(scope, "DISP:DATA? PNG")
+    path = out_dir / f"{prefix}screenshot.png"
+    with open(path, "wb") as f:
+        f.write(png)
+    print(f"Saved {path}  ({len(png)} bytes)")
+
+
 # ── Validation ───────────────────────────────────────────────────────
 
 def _validate_channels(channels):
@@ -367,6 +382,7 @@ def main():
         _save_aligned_csv(waveforms, ref_wf, OUT_PREFIX, out_dir)
         _save_decimated_csv(waveforms, ref_wf, OUT_PREFIX, out_dir)
         _plot_aligned_vs_decimated(out_dir, OUT_PREFIX, CHANNELS)
+        _save_screenshot(scope, out_dir, OUT_PREFIX)
     finally:
         scope.close()
         rm.close()
