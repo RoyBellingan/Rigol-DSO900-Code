@@ -844,23 +844,114 @@ namespace
     {
         return "local-time-unavailable-in-portable-std-only-build";
     }
+
+    [[nodiscard]] static std::string stripFileUrl(std::string path)
+    {
+        constexpr std::string_view prefix = "file://";
+        if (path.starts_with(prefix))
+            path.erase(0, prefix.size());
+        return path;
+    }
+
+    [[nodiscard]] static bool isExistingDirectory(const std::filesystem::path& p)
+    {
+        std::error_code ec;
+        return std::filesystem::is_directory(p, ec);
+    }
+
+    [[nodiscard]] static std::string resolveDecimatedCsv(const std::filesystem::path& dir)
+    {
+        static constexpr std::array<const char*, 2> candidates = {"_decimated.csv", "decimated.csv"};
+        for (const char* name : candidates)
+        {
+            const auto candidate = dir / name;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(candidate, ec))
+                return candidate.string();
+        }
+        throw std::runtime_error(
+            "No decimated CSV in folder: expected _decimated.csv or decimated.csv in " + dir.string());
+    }
+
+    struct RunPaths
+    {
+        std::string inputCsv;
+        std::string outputLog;
+        double targetFundamentalHz = 50.0;
+        int maxHarmonic = 15;
+    };
+
+    [[nodiscard]] static RunPaths parseRunPaths(int argc, char** argv)
+    {
+        if (argc < 2)
+            throw std::runtime_error("missing argument");
+
+        const std::filesystem::path firstArg = stripFileUrl(argv[1]);
+        if (isExistingDirectory(firstArg))
+        {
+            RunPaths paths;
+            paths.inputCsv = resolveDecimatedCsv(firstArg);
+            paths.outputLog = (firstArg / "output.log").string();
+            if (argc >= 3)
+                paths.targetFundamentalHz = std::stod(argv[2]);
+            if (argc >= 4)
+                paths.maxHarmonic = std::stoi(argv[3]);
+            if (argc >= 5)
+                throw std::runtime_error("too many arguments for folder mode");
+            return paths;
+        }
+
+        if (argc < 3)
+            throw std::runtime_error("missing output log path");
+
+        RunPaths paths;
+        paths.inputCsv = argv[1];
+        paths.outputLog = argv[2];
+        if (argc >= 4)
+            paths.targetFundamentalHz = std::stod(argv[3]);
+        if (argc >= 5)
+            paths.maxHarmonic = std::stoi(argv[4]);
+        if (argc >= 6)
+            throw std::runtime_error("too many arguments");
+        return paths;
+    }
+
+    static void printUsage(const char* program)
+    {
+        std::cerr
+            << "Usage:\n"
+            << "  " << program << " <capture_folder> [fundamental_hz] [max_harmonic]\n"
+            << "  " << program << " <input.csv> <output.log> [fundamental_hz] [max_harmonic]\n"
+            << "\n"
+            << "Folder mode reads <folder>/_decimated.csv or <folder>/decimated.csv\n"
+            << "and writes <folder>/output.log\n";
+    }
 }
 
 int main(int argc, char** argv)
 {
     try
     {
-        if (argc < 3)
+        RunPaths paths;
+        try
         {
-            std::cerr << "Usage: " << argv[0]
-            << " <input.csv> <output.log> [fundamental_hz] [max_harmonic]\n";
-            return 1;
+            paths = parseRunPaths(argc, argv);
+        }
+        catch (const std::runtime_error& e)
+        {
+            if (std::string_view(e.what()) == "missing argument" ||
+                std::string_view(e.what()) == "missing output log path")
+            {
+                printUsage(argv[0]);
+                return 1;
+            }
+            throw;
         }
 
-        const std::string inputCsv = argv[1];
-        const std::string outputLog = argv[2];
-        const double targetFundamentalHz = (argc >= 4) ? std::stod(argv[3]) : 50.0;
-        const int maxHarmonic = (argc >= 5) ? std::stoi(argv[4]) : 15;
+        const std::string& inputCsv = paths.inputCsv;
+        const std::string& outputLog = paths.outputLog;
+        const double targetFundamentalHz = paths.targetFundamentalHz;
+        const int maxHarmonic = paths.maxHarmonic;
 
         if (targetFundamentalHz <= 0.0)
             throw std::runtime_error("fundamental_hz must be > 0");

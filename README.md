@@ -93,3 +93,28 @@ This was found empirically on **DHO924S firmware 00.01.02**.  If you still see t
 | `test2.py` | Earlier single-channel experiment |
 | `12bit check.py` | WORD-format (16-bit) feasibility test |
 | `scope_analyzer.cpp` | Offline C++ waveform analyser |
+| `analyze_capture.sh` | Wrapper: drag a capture folder onto this script |
+
+### Scope analyzer
+
+Build:
+
+```bash
+g++ -std=c++20 -O2 -Wall -Wextra -o scope_analyzer scope_analyzer.cpp -lfftw3
+chmod +x analyze_capture.sh
+```
+
+Run on a capture folder (reads `_decimated.csv` or `decimated.csv`, writes `output.log`):
+
+```bash
+./analyze_capture.sh "220Ohm 0.4A"
+# same as: ./scope_analyzer "220Ohm 0.4A"
+```
+
+Or with explicit CSV paths:
+
+```bash
+./scope_analyzer input.csv output.log [fundamental_hz] [max_harmonic]
+```
+
+**Drag-and-drop:** in the file manager, drag a capture folder onto `analyze_capture.sh` (works in Dolphin and most KDE setups). A terminal may flash briefly depending on your file-manager settings.
