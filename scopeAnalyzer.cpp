@@ -1,4 +1,9 @@
+
+
 #include "scope_analyzer.hpp"
+
+//g++ scope_analyzer.cpp -lfftw3 --std=c++23 -o scopeAnalyzer
+
 
 #include <fftw3.h>
 
