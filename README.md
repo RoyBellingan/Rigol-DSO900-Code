@@ -1,40 +1,58 @@
 # DHO900
 
-Python utility for downloading **deep-memory waveforms** from **Rigol DHO800/DHO900-series** oscilloscopes (tested on DHO924S) over the LAN via SCPI.
+Tools for downloading **deep-memory waveforms** from **Rigol DHO800/DHO900-series** oscilloscopes (tested on DHO924S) over the LAN via SCPI, plus offline FFT analysis.
 
-## What it does
+## Quick start (recommended: C++)
+
+```bash
+g++ -std=c++20 -O2 -Wall -Wextra -o scope_download \
+    scope_download.cpp scope_download_main.cpp scope_analyzer.cpp -lfftw3 -pthread
+
+./scope_download              # all channels 1-4
+./scope_download 1 3          # CHAN1 and CHAN3 only
+./scope_download --channels 1,3,4 --no-plots
+```
+
+**Requirements:** scope on the LAN (TCP port **5555**), `libfftw3`, `python3` + `matplotlib` only for verification PNGs (`plot_checks.py`). No VISA install needed.
+
+Output goes to `aq_YYYY-MM-DD_HHMMSS/` with CSVs, PNG checks, screenshot, and **`output.log`** (FFT/harmonic analysis of `_decimated.csv` via `scope_analyzer`).
+
+### `scope_download` options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--ip` | `192.168.1.162` | Scope IP address |
+| `--port` | `5555` | SCPI TCP port |
+| `[channels...]` | `1 2 3 4` | Positional channel numbers (1..4) |
+| `--channels` | `1,2,3,4` | Same as positional, comma-separated |
+| `--chunk` | `250000` | Samples per `:WAV:DATA?` request |
+| `--decimate` | `10000` | Row count for `_decimated.csv` |
+| `--reset-pause` | `0.5` | Pause between channel reads (firmware workaround) |
+| `--out-prefix` | *(empty)* | File prefix (`_CHAN1.csv`, etc.) |
+| `--out-dir-prefix` | `aq_` | Output folder prefix |
+| `--no-plots` | off | Skip `_CHAN*_check.png` |
+| `--no-screenshot` | off | Skip `screenshot.png` |
+| `--no-analysis` | off | Skip `output.log` (FFT report) |
+| `--fundamental` | `50` | Target fundamental [Hz] for analysis |
+| `--max-harmonic` | `15` | Max harmonic order for analysis |
+
+## Python download (`download1.py`)
+
+Legacy/reference implementation using PyVISA-py. Slower CSV export; same SCPI logic and output layout.
+
+### What it does
 
 1. Connects to the scope over **VISA TCP/IP**.
 2. Stops the acquisition (`:STOP`).
 3. Reads every requested channel's full RAW buffer from internal memory.
-4. Exports:
-   - **Per-channel CSV** (`_CHAN1.csv`, ...) — every sample with absolute timestamps.
-   - **Aligned CSV** (`_aligned.csv`) — all channels at the shortest channel's sample count, shared time axis.
-   - **Decimated CSV** (`_decimated.csv`) — down-sampled to `OUTPUT_POINTS` rows.
-   - **Verification plots** (`_CHAN*_check.png`) — aligned trace with decimated dots overlaid for quick sanity-checking.
+4. Exports per-channel, aligned, and decimated CSVs plus verification plots.
 
-All output goes to a timestamped folder (`aq_YYYY-MM-DD_HHMMSS/`).
-
-## Requirements
+### Requirements
 
 - **Python 3.10+** (3.11+ recommended).
-- Scope on the LAN with VISA TCP access enabled.
-- Dependencies listed in `requirements.txt`:
-
-```
-pip install -r requirements.txt
-```
-
-The `@py` backend (PyVISA-py) is used — no National Instruments VISA needed on Linux.
-
-## Quick start
+- `pip install -r requirements.txt` (PyVISA + PyVISA-py + matplotlib).
 
 ```bash
-# one-time setup
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# edit config at the top of download1.py (IP, CHANNELS, etc.), then:
 python download1.py
 ```
 
@@ -90,9 +108,13 @@ This was found empirically on **DHO924S firmware 00.01.02**.  If you still see t
 
 | File | Purpose |
 |---|---|
+| `scope_download` | Fast C++ deep-memory downloader (build from `scope_download*.cpp`) |
+| `plot_checks.py` | Verification PNGs from `_decimated.csv` only |
+| `download1.py` | Python downloader (reference) |
 | `test2.py` | Earlier single-channel experiment |
 | `12bit check.py` | WORD-format (16-bit) feasibility test |
-| `scope_analyzer.cpp` | Offline C++ waveform analyser |
+| `scope_analyzer.hpp` / `scope_analyzer.cpp` | Reusable C++ waveform analysis library |
+| `scope_analyzer_main.cpp` | CLI entry point for the analyser |
 | `analyze_capture.sh` | Wrapper: drag a capture folder onto this script |
 
 ### Scope analyzer
@@ -100,7 +122,7 @@ This was found empirically on **DHO924S firmware 00.01.02**.  If you still see t
 Build:
 
 ```bash
-g++ -std=c++20 -O2 -Wall -Wextra -o scope_analyzer scope_analyzer.cpp -lfftw3
+g++ -std=c++20 -O2 -Wall -Wextra -o scope_analyzer scope_analyzer.cpp scope_analyzer_main.cpp -lfftw3
 chmod +x analyze_capture.sh
 ```
 
@@ -115,6 +137,19 @@ Or with explicit CSV paths:
 
 ```bash
 ./scope_analyzer input.csv output.log [fundamental_hz] [max_harmonic]
+```
+
+Reuse the analysis logic from another C++ tool:
+
+```cpp
+#include "scope_analyzer.hpp"
+
+scope_analyzer::AnalysisOptions opts;
+opts.targetFundamentalHz = 50.0;
+opts.maxHarmonic = 15;
+
+auto result = scope_analyzer::analyzeCsvFile("capture/_decimated.csv", opts);
+// result.channels, result.pairs, result.fs, ...
 ```
 
 **Drag-and-drop:** in the file manager, drag a capture folder onto `analyze_capture.sh` (works in Dolphin and most KDE setups). A terminal may flash briefly depending on your file-manager settings.

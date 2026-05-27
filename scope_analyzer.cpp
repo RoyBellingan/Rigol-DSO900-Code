@@ -1,3 +1,5 @@
+#include "scope_analyzer.hpp"
+
 #include <fftw3.h>
 
 #include <algorithm>
@@ -8,107 +10,24 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <optional>
 #include <ranges>
 #include <sstream>
-#include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
-#include <vector>
 
+namespace scope_analyzer
+{
 namespace
 {
-    constexpr double PI = 3.1415926535897932384626433832795;
 
-    struct CsvData
-    {
-        std::vector<std::string> headers;
-        std::vector<std::vector<double>> columns;
-    };
-
-    struct HarmonicInfo
-    {
-        int harmonic = 0;
-        double freqHz = 0.0;
-        int fftBin = -1;
-        double amplitude = 0.0;      // peak amplitude estimate
-        double phaseRad = 0.0;
-        double phaseDeg = 0.0;
-        double relToFundamental = 0.0;
-    };
-
-    struct ChannelStats
-    {
-        std::string name;
-
-        double mean = 0.0;
-        double rms = 0.0;
-        double stddev = 0.0;
-        double minv = 0.0;
-        double maxv = 0.0;
-        double p2p = 0.0;
-        double crestFactor = 0.0;
-
-        double fundamentalHz = 0.0;
-        int fundamentalBin = -1;
-        double fundamentalAmplitude = 0.0;
-        double fundamentalPhaseRad = 0.0;
-        double fundamentalPhaseDeg = 0.0;
-
-        double dominantFreqHz = 0.0;
-        int dominantBin = -1;
-        double dominantAmplitude = 0.0;
-
-        double thd = 0.0;
-        double totalSpectralEnergy = 0.0;
-        double harmonicEnergy = 0.0;
-        double fundamentalEnergyRatio = 0.0;
-
-        double sineResidualRMS = 0.0;
-        double sineResidualToSignalRMS = 0.0;
-        double sineResidualToSignalStd = 0.0;
-
-        double zeroCrossingTime = std::numeric_limits<double>::quiet_NaN();
-
-        std::vector<HarmonicInfo> harmonics;
-        std::vector<double> detrended;
-        std::vector<double> sineResidual;
-    };
-
-    struct PairStats
-    {
-        std::string a;
-        std::string b;
-
-        double pearsonCorrelation = 0.0;
-        double normalizedDot = 0.0;
-
-        double amplitudeRatio = 0.0;
-
-        double phaseDiffRad = 0.0;
-        double phaseDiffDeg = 0.0;
-        double timeShiftSec = 0.0;
-        double timeShiftUs = 0.0;
-
-        int bestLagSamples = 0;
-        double bestLagSec = 0.0;
-        double bestLagUs = 0.0;
-        double bestLagCorrelation = 0.0;
-
-        double alignedCorrelation = 0.0;
-        double harmonicSimilarity = 0.0; // 1 is ideal
-        double residualCorrelation = 0.0;
-    };
-
-    [[nodiscard]] static std::string trim(std::string_view sv)
+    [[nodiscard]] std::string trim(std::string_view sv)
     {
         std::size_t a = 0;
         while (a < sv.size() && std::isspace(static_cast<unsigned char>(sv[a])))
@@ -127,7 +46,7 @@ namespace
         return std::string(sv.substr(a, b - a));
     }
 
-    [[nodiscard]] static std::string asciiLowerCopy(std::string_view sv)
+    [[nodiscard]] std::string asciiLowerCopy(std::string_view sv)
     {
         std::string s(trim(sv));
         for (char& c : s)
@@ -135,38 +54,7 @@ namespace
         return s;
     }
 
-    [[nodiscard]] static bool isTimeColumnHeader(const std::string& header)
-    {
-        const std::string k = asciiLowerCopy(header);
-        if (k == "time" || k == "time_s" || k == "t_s" || k == "timestamp" || k == "seconds" || k == "sec")
-            return true;
-        std::string compact;
-        compact.reserve(k.size());
-        for (char c : k)
-        {
-            if (!std::isspace(static_cast<unsigned char>(c)))
-                compact.push_back(c);
-        }
-        return compact == "time(s)" || compact == "time[s]";
-    }
-
-    [[nodiscard]] static bool isAuxiliarySkipHeader(const std::string& header)
-    {
-        const std::string k = asciiLowerCopy(header);
-        return k == "rowid" || k == "row_id" || k == "rowindex" || k == "row_index";
-    }
-
-    [[nodiscard]] static std::size_t findTimeColumnIndex(const std::vector<std::string>& headers)
-    {
-        for (std::size_t i = 0; i < headers.size(); ++i)
-        {
-            if (isTimeColumnHeader(headers[i]))
-                return i;
-        }
-        return 0;
-    }
-
-    [[nodiscard]] static std::vector<std::string> splitCsvLine(const std::string& line)
+    [[nodiscard]] std::vector<std::string> splitCsvLine(const std::string& line)
     {
         std::vector<std::string> out;
         std::string cur;
@@ -201,7 +89,7 @@ namespace
         return out;
     }
 
-    [[nodiscard]] static std::optional<double> parseDouble(std::string_view sv)
+    [[nodiscard]] std::optional<double> parseDouble(std::string_view sv)
     {
         sv = std::string_view(sv).substr(0, sv.size());
 
@@ -231,77 +119,24 @@ namespace
         }
     }
 
-    [[nodiscard]] static CsvData readCsv(const std::string& path)
-    {
-        std::ifstream fin(path);
-        if (!fin)
-            throw std::runtime_error("Cannot open input CSV: " + path);
-
-        std::string line;
-        if (!std::getline(fin, line))
-            throw std::runtime_error("CSV is empty");
-
-        CsvData data;
-        data.headers = splitCsvLine(line);
-        if (data.headers.empty())
-            throw std::runtime_error("CSV header is empty");
-
-        data.columns.resize(data.headers.size());
-
-        std::size_t row = 0;
-        while (std::getline(fin, line))
-        {
-            ++row;
-            if (line.empty())
-                continue;
-
-            auto fields = splitCsvLine(line);
-            if (fields.size() < data.headers.size())
-                fields.resize(data.headers.size());
-
-            bool anyValid = false;
-            std::vector<double> parsed(data.headers.size(), std::numeric_limits<double>::quiet_NaN());
-
-            for (std::size_t c = 0; c < data.headers.size(); ++c)
-            {
-                if (auto v = parseDouble(fields[c]); v.has_value())
-                {
-                    parsed[c] = *v;
-                    anyValid = true;
-                }
-            }
-
-            if (!anyValid)
-                continue;
-
-            for (std::size_t c = 0; c < data.headers.size(); ++c)
-                data.columns[c].push_back(parsed[c]);
-        }
-
-        if (data.columns.empty() || data.columns[0].empty())
-            throw std::runtime_error("No numeric rows found in CSV");
-
-        return data;
-    }
-
-    [[nodiscard]] static bool isFiniteVector(const std::vector<double>& v)
+    [[nodiscard]] bool isFiniteVector(const std::vector<double>& v)
     {
         return std::ranges::all_of(v, [](double x){ return std::isfinite(x); });
     }
 
-    [[nodiscard]] static double mean(const std::vector<double>& v)
+    [[nodiscard]] double mean(const std::vector<double>& v)
     {
         return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
     }
 
-    [[nodiscard]] static double rms(const std::vector<double>& v)
+    [[nodiscard]] double rms(const std::vector<double>& v)
     {
         double s = 0.0;
         for (double x : v) s += x * x;
         return std::sqrt(s / static_cast<double>(v.size()));
     }
 
-    [[nodiscard]] static double stddev(const std::vector<double>& v, double mu)
+    [[nodiscard]] double stddev(const std::vector<double>& v, double mu)
     {
         double s = 0.0;
         for (double x : v)
@@ -312,17 +147,17 @@ namespace
         return std::sqrt(s / static_cast<double>(v.size()));
     }
 
-    [[nodiscard]] static double minValue(const std::vector<double>& v)
+    [[nodiscard]] double minValue(const std::vector<double>& v)
     {
         return *std::ranges::min_element(v);
     }
 
-    [[nodiscard]] static double maxValue(const std::vector<double>& v)
+    [[nodiscard]] double maxValue(const std::vector<double>& v)
     {
         return *std::ranges::max_element(v);
     }
 
-    [[nodiscard]] static std::vector<double> detrendDc(const std::vector<double>& v, double mu)
+    [[nodiscard]] std::vector<double> detrendDc(const std::vector<double>& v, double mu)
     {
         std::vector<double> out(v.size());
         for (std::size_t i = 0; i < v.size(); ++i)
@@ -330,35 +165,14 @@ namespace
         return out;
     }
 
-    [[nodiscard]] static double estimateDt(const std::vector<double>& t)
-    {
-        if (t.size() < 2)
-            throw std::runtime_error("Need at least 2 time samples");
-
-        std::vector<double> dts;
-        dts.reserve(t.size() - 1);
-        for (std::size_t i = 1; i < t.size(); ++i)
-        {
-            const double dt = t[i] - t[i - 1];
-            if (std::isfinite(dt) && dt > 0)
-                dts.push_back(dt);
-        }
-
-        if (dts.empty())
-            throw std::runtime_error("Invalid time axis");
-
-        std::ranges::sort(dts);
-        return dts[dts.size() / 2];
-    }
-
     struct FftResult
     {
         int n = 0;
         double fs = 0.0;
-        std::vector<std::complex<double>> bins; // 0..N/2
+        std::vector<std::complex<double>> bins;
     };
 
-    [[nodiscard]] static FftResult computeRfft(const std::vector<double>& x, double fs)
+    [[nodiscard]] FftResult computeRfft(const std::vector<double>& x, double fs)
     {
         const int N = static_cast<int>(x.size());
         if (N < 4)
@@ -392,12 +206,12 @@ namespace
         return result;
     }
 
-    [[nodiscard]] static double binFrequency(const FftResult& fft, int k)
+    [[nodiscard]] double binFrequency(const FftResult& fft, int k)
     {
         return static_cast<double>(k) * fft.fs / static_cast<double>(fft.n);
     }
 
-    [[nodiscard]] static double binAmplitudePeak(const FftResult& fft, int k)
+    [[nodiscard]] double binAmplitudePeak(const FftResult& fft, int k)
     {
         const double mag = std::abs(fft.bins[k]);
         if (k == 0 || (fft.n % 2 == 0 && k == fft.n / 2))
@@ -405,19 +219,19 @@ namespace
         return 2.0 * mag / static_cast<double>(fft.n);
     }
 
-    [[nodiscard]] static double binPhaseRad(const FftResult& fft, int k)
+    [[nodiscard]] double binPhaseRad(const FftResult& fft, int k)
     {
         return std::atan2(fft.bins[k].imag(), fft.bins[k].real());
     }
 
-    [[nodiscard]] static int nearestBin(const FftResult& fft, double freqHz)
+    [[nodiscard]] int nearestBin(const FftResult& fft, double freqHz)
     {
         int k = static_cast<int>(std::llround(freqHz * static_cast<double>(fft.n) / fft.fs));
         k = std::clamp(k, 0, static_cast<int>(fft.bins.size()) - 1);
         return k;
     }
 
-    [[nodiscard]] static int dominantBinIgnoringDc(const FftResult& fft)
+    [[nodiscard]] int dominantBinIgnoringDc(const FftResult& fft)
     {
         int best = 1;
         double bestMag = 0.0;
@@ -433,24 +247,24 @@ namespace
         return best;
     }
 
-    [[nodiscard]] static double wrapPhasePi(double x)
+    [[nodiscard]] double wrapPhasePi(double x)
     {
         while (x > PI)  x -= 2.0 * PI;
         while (x < -PI) x += 2.0 * PI;
         return x;
     }
 
-    [[nodiscard]] static double radToDeg(double r)
+    [[nodiscard]] double radToDeg(double r)
     {
         return r * 180.0 / PI;
     }
 
-    [[nodiscard]] static double degToTimeSec(double deg, double freqHz)
+    [[nodiscard]] double degToTimeSec(double deg, double freqHz)
     {
         return deg / 360.0 / freqHz;
     }
 
-    [[nodiscard]] static double pearsonCorrelation(const std::vector<double>& a, const std::vector<double>& b)
+    [[nodiscard]] double pearsonCorrelation(const std::vector<double>& a, const std::vector<double>& b)
     {
         const std::size_t n = std::min(a.size(), b.size());
         if (n < 2) return 0.0;
@@ -475,7 +289,7 @@ namespace
         return num / den;
     }
 
-    [[nodiscard]] static double normalizedDot(const std::vector<double>& a, const std::vector<double>& b)
+    [[nodiscard]] double normalizedDot(const std::vector<double>& a, const std::vector<double>& b)
     {
         const std::size_t n = std::min(a.size(), b.size());
         if (n == 0) return 0.0;
@@ -495,7 +309,7 @@ namespace
         return num / den;
     }
 
-    [[nodiscard]] static std::pair<int, double> bestCrossCorrelationLag(
+    [[nodiscard]] std::pair<int, double> bestCrossCorrelationLag(
         const std::vector<double>& a,
         const std::vector<double>& b,
         int maxLag)
@@ -536,7 +350,7 @@ namespace
         return {bestLag, bestScore};
     }
 
-    [[nodiscard]] static std::vector<double> shiftSignal(const std::vector<double>& x, int lag)
+    [[nodiscard]] std::vector<double> shiftSignal(const std::vector<double>& x, int lag)
     {
         std::vector<double> out(x.size(), 0.0);
 
@@ -552,7 +366,7 @@ namespace
         return out;
     }
 
-    [[nodiscard]] static double estimateZeroCrossingTime(
+    [[nodiscard]] double estimateZeroCrossingTime(
         const std::vector<double>& t,
         const std::vector<double>& x)
     {
@@ -572,7 +386,7 @@ namespace
         return std::numeric_limits<double>::quiet_NaN();
     }
 
-    [[nodiscard]] static std::vector<double> buildBestFitSine(
+    [[nodiscard]] std::vector<double> buildBestFitSine(
         std::size_t n,
         double fs,
         double freqHz,
@@ -588,7 +402,7 @@ namespace
         return y;
     }
 
-    [[nodiscard]] static std::vector<double> residual(
+    [[nodiscard]] std::vector<double> residual(
         const std::vector<double>& x,
         const std::vector<double>& fit)
     {
@@ -598,7 +412,7 @@ namespace
         return r;
     }
 
-    [[nodiscard]] static double harmonicSimilarity(
+    [[nodiscard]] double harmonicSimilarity(
         const std::vector<HarmonicInfo>& a,
         const std::vector<HarmonicInfo>& b)
     {
@@ -620,462 +434,545 @@ namespace
         return std::max(0.0, 1.0 - err / denom);
     }
 
-    [[nodiscard]] static ChannelStats analyzeChannel(
-        const std::string& name,
-        const std::vector<double>& time,
-        const std::vector<double>& raw,
-        double fs,
-        double targetFundamentalHz,
-        int maxHarmonic)
-    {
-        ChannelStats s;
-        s.name = name;
-
-        s.mean = mean(raw);
-        s.rms = rms(raw);
-        s.stddev = stddev(raw, s.mean);
-        s.minv = minValue(raw);
-        s.maxv = maxValue(raw);
-        s.p2p = s.maxv - s.minv;
-        s.crestFactor = (s.rms > 0.0) ? std::max(std::abs(s.minv), std::abs(s.maxv)) / s.rms : 0.0;
-
-        s.detrended = detrendDc(raw, s.mean);
-        s.zeroCrossingTime = estimateZeroCrossingTime(time, s.detrended);
-
-        const auto fft = computeRfft(s.detrended, fs);
-
-        s.fundamentalHz = targetFundamentalHz;
-        s.fundamentalBin = nearestBin(fft, targetFundamentalHz);
-        s.fundamentalAmplitude = binAmplitudePeak(fft, s.fundamentalBin);
-        s.fundamentalPhaseRad = binPhaseRad(fft, s.fundamentalBin);
-        s.fundamentalPhaseDeg = radToDeg(s.fundamentalPhaseRad);
-
-        s.dominantBin = dominantBinIgnoringDc(fft);
-        s.dominantFreqHz = binFrequency(fft, s.dominantBin);
-        s.dominantAmplitude = binAmplitudePeak(fft, s.dominantBin);
-
-        s.harmonics.resize(static_cast<std::size_t>(maxHarmonic + 1));
-        double harmonicPowerWithoutFundamental = 0.0;
-        double totalPower = 0.0;
-
-        for (int k = 1; k < static_cast<int>(fft.bins.size()); ++k)
-        {
-            const double a = binAmplitudePeak(fft, k);
-            totalPower += a * a;
-        }
-
-        for (int h = 1; h <= maxHarmonic; ++h)
-        {
-            const double f = targetFundamentalHz * static_cast<double>(h);
-            const int bin = nearestBin(fft, f);
-            HarmonicInfo hi;
-            hi.harmonic = h;
-            hi.freqHz = binFrequency(fft, bin);
-            hi.fftBin = bin;
-            hi.amplitude = binAmplitudePeak(fft, bin);
-            hi.phaseRad = binPhaseRad(fft, bin);
-            hi.phaseDeg = radToDeg(hi.phaseRad);
-            hi.relToFundamental = (s.fundamentalAmplitude > 0.0) ? hi.amplitude / s.fundamentalAmplitude : 0.0;
-            s.harmonics[static_cast<std::size_t>(h)] = hi;
-
-            if (h >= 2)
-                harmonicPowerWithoutFundamental += hi.amplitude * hi.amplitude;
-        }
-
-        s.totalSpectralEnergy = totalPower;
-        s.harmonicEnergy = harmonicPowerWithoutFundamental;
-        s.fundamentalEnergyRatio = (totalPower > 0.0) ? (s.fundamentalAmplitude * s.fundamentalAmplitude) / totalPower : 0.0;
-        s.thd = (s.fundamentalAmplitude > 0.0) ? std::sqrt(harmonicPowerWithoutFundamental) / s.fundamentalAmplitude : 0.0;
-
-        const auto fit = buildBestFitSine(s.detrended.size(), fs, targetFundamentalHz, s.fundamentalAmplitude, s.fundamentalPhaseRad);
-        s.sineResidual = residual(s.detrended, fit);
-        s.sineResidualRMS = rms(s.sineResidual);
-        s.sineResidualToSignalRMS = (rms(s.detrended) > 0.0) ? s.sineResidualRMS / rms(s.detrended) : 0.0;
-        s.sineResidualToSignalStd = (s.stddev > 0.0) ? stddev(s.sineResidual, mean(s.sineResidual)) / s.stddev : 0.0;
-
-        return s;
-    }
-
-    [[nodiscard]] static PairStats analyzePair(
-        const ChannelStats& a,
-        const ChannelStats& b,
-        double fs,
-        double fundamentalHz)
-    {
-        PairStats p;
-        p.a = a.name;
-        p.b = b.name;
-
-        p.pearsonCorrelation = pearsonCorrelation(a.detrended, b.detrended);
-        p.normalizedDot = normalizedDot(a.detrended, b.detrended);
-        p.amplitudeRatio = (b.rms > 0.0) ? a.rms / b.rms : 0.0;
-
-        p.phaseDiffRad = wrapPhasePi(b.fundamentalPhaseRad - a.fundamentalPhaseRad);
-        p.phaseDiffDeg = radToDeg(p.phaseDiffRad);
-        p.timeShiftSec = degToTimeSec(p.phaseDiffDeg, fundamentalHz);
-        p.timeShiftUs = p.timeShiftSec * 1e6;
-
-        const int maxLag = std::max(1, static_cast<int>(std::llround(fs / fundamentalHz * 0.5)));
-        auto [lag, score] = bestCrossCorrelationLag(a.detrended, b.detrended, maxLag);
-        p.bestLagSamples = lag;
-        p.bestLagSec = static_cast<double>(lag) / fs;
-        p.bestLagUs = p.bestLagSec * 1e6;
-        p.bestLagCorrelation = score;
-
-        const auto shiftedB = shiftSignal(b.detrended, lag);
-        p.alignedCorrelation = pearsonCorrelation(a.detrended, shiftedB);
-
-        p.harmonicSimilarity = harmonicSimilarity(a.harmonics, b.harmonics);
-        p.residualCorrelation = pearsonCorrelation(a.sineResidual, b.sineResidual);
-
-        return p;
-    }
-
-    static void writeSeparator(std::ostream& os, char ch = '=', int count = 90)
+    void writeSeparator(std::ostream& os, char ch = '=', int count = 90)
     {
         for (int i = 0; i < count; ++i) os << ch;
         os << '\n';
     }
 
-    static void writeChannelReport(
-        std::ostream& os,
-        const ChannelStats& s)
-    {
-        writeSeparator(os);
-        os << "CHANNEL: " << s.name << "\n";
-        writeSeparator(os, '-');
-
-        os << std::fixed << std::setprecision(9);
-        os << "Mean/DC                     : " << s.mean << "\n";
-        os << "RMS                         : " << s.rms << "\n";
-        os << "StdDev                      : " << s.stddev << "\n";
-        os << "Min                         : " << s.minv << "\n";
-        os << "Max                         : " << s.maxv << "\n";
-        os << "Peak-to-peak                : " << s.p2p << "\n";
-        os << "Crest factor                : " << s.crestFactor << "\n";
-        os << "\n";
-
-        os << "Dominant FFT bin            : " << s.dominantBin << "\n";
-        os << "Dominant frequency [Hz]     : " << s.dominantFreqHz << "\n";
-        os << "Dominant amplitude          : " << s.dominantAmplitude << "\n";
-        os << "\n";
-
-        os << "Target fundamental [Hz]     : " << s.fundamentalHz << "\n";
-        os << "Fundamental bin             : " << s.fundamentalBin << "\n";
-        os << "Fundamental amplitude       : " << s.fundamentalAmplitude << "\n";
-        os << "Fundamental phase [rad]     : " << s.fundamentalPhaseRad << "\n";
-        os << "Fundamental phase [deg]     : " << s.fundamentalPhaseDeg << "\n";
-        os << "\n";
-
-        os << "THD                         : " << s.thd << "\n";
-        os << "Total spectral energy       : " << s.totalSpectralEnergy << "\n";
-        os << "Harmonic energy (2..N)      : " << s.harmonicEnergy << "\n";
-        os << "Fundamental energy ratio    : " << s.fundamentalEnergyRatio << "\n";
-        os << "\n";
-
-        os << "Sine residual RMS           : " << s.sineResidualRMS << "\n";
-        os << "Residual / signal RMS       : " << s.sineResidualToSignalRMS << "\n";
-        os << "Residual / signal StdDev    : " << s.sineResidualToSignalStd << "\n";
-        os << "\n";
-
-        if (std::isfinite(s.zeroCrossingTime))
-            os << "First rising zero-cross [s] : " << s.zeroCrossingTime << "\n";
-        else
-            os << "First rising zero-cross [s] : n/a\n";
-
-        os << "\n";
-        os << "HARMONICS\n";
-        writeSeparator(os, '.');
-        os << "H  "
-        << std::setw(14) << "Freq[Hz]"
-        << std::setw(12) << "Bin"
-        << std::setw(18) << "Amplitude"
-        << std::setw(18) << "Phase[deg]"
-        << std::setw(18) << "Rel/Fund"
-        << "\n";
-
-        for (std::size_t h = 1; h < s.harmonics.size(); ++h)
-        {
-            const auto& hi = s.harmonics[h];
-            os << std::setw(2) << hi.harmonic
-            << std::setw(14) << hi.freqHz
-            << std::setw(12) << hi.fftBin
-            << std::setw(18) << hi.amplitude
-            << std::setw(18) << hi.phaseDeg
-            << std::setw(18) << hi.relToFundamental
-            << "\n";
-        }
-        os << "\n";
-    }
-
-    static void writePairReport(
-        std::ostream& os,
-        const PairStats& p)
-    {
-        writeSeparator(os);
-        os << "PAIR: " << p.a << "  <->  " << p.b << "\n";
-        writeSeparator(os, '-');
-
-        os << std::fixed << std::setprecision(9);
-        os << "Pearson correlation         : " << p.pearsonCorrelation << "\n";
-        os << "Normalized dot              : " << p.normalizedDot << "\n";
-        os << "Amplitude ratio A/B         : " << p.amplitudeRatio << "\n";
-        os << "\n";
-
-        os << "Phase diff [rad]            : " << p.phaseDiffRad << "\n";
-        os << "Phase diff [deg]            : " << p.phaseDiffDeg << "\n";
-        os << "Time shift [s]              : " << p.timeShiftSec << "\n";
-        os << "Time shift [us]             : " << p.timeShiftUs << "\n";
-        os << "\n";
-
-        os << "Best cross-corr lag [samp]  : " << p.bestLagSamples << "\n";
-        os << "Best cross-corr lag [s]     : " << p.bestLagSec << "\n";
-        os << "Best cross-corr lag [us]    : " << p.bestLagUs << "\n";
-        os << "Best cross-corr score       : " << p.bestLagCorrelation << "\n";
-        os << "Aligned correlation         : " << p.alignedCorrelation << "\n";
-        os << "\n";
-
-        os << "Harmonic similarity         : " << p.harmonicSimilarity << "\n";
-        os << "Residual correlation        : " << p.residualCorrelation << "\n";
-        os << "\n";
-    }
-
-    [[nodiscard]] static std::string nowString()
+    [[nodiscard]] std::string nowString()
     {
         return "local-time-unavailable-in-portable-std-only-build";
     }
 
-    [[nodiscard]] static std::string stripFileUrl(std::string path)
-    {
-        constexpr std::string_view prefix = "file://";
-        if (path.starts_with(prefix))
-            path.erase(0, prefix.size());
-        return path;
-    }
-
-    [[nodiscard]] static bool isExistingDirectory(const std::filesystem::path& p)
+    [[nodiscard]] bool isExistingDirectory(const std::filesystem::path& p)
     {
         std::error_code ec;
         return std::filesystem::is_directory(p, ec);
     }
 
-    [[nodiscard]] static std::string resolveDecimatedCsv(const std::filesystem::path& dir)
+    void validateAnalysisOptions(const AnalysisOptions& options)
     {
-        static constexpr std::array<const char*, 2> candidates = {"_decimated.csv", "decimated.csv"};
-        for (const char* name : candidates)
-        {
-            const auto candidate = dir / name;
-            std::error_code ec;
-            if (std::filesystem::is_regular_file(candidate, ec))
-                return candidate.string();
-        }
-        throw std::runtime_error(
-            "No decimated CSV in folder: expected _decimated.csv or decimated.csv in " + dir.string());
+        if (options.targetFundamentalHz <= 0.0)
+            throw std::runtime_error("fundamental_hz must be > 0");
+        if (options.maxHarmonic < 1)
+            throw std::runtime_error("max_harmonic must be >= 1");
     }
 
-    struct RunPaths
-    {
-        std::string inputCsv;
-        std::string outputLog;
-        double targetFundamentalHz = 50.0;
-        int maxHarmonic = 15;
-    };
+} // namespace
 
-    [[nodiscard]] static RunPaths parseRunPaths(int argc, char** argv)
+bool isTimeColumnHeader(const std::string& header)
+{
+    const std::string k = asciiLowerCopy(header);
+    if (k == "time" || k == "time_s" || k == "t_s" || k == "timestamp" || k == "seconds" || k == "sec")
+        return true;
+    std::string compact;
+    compact.reserve(k.size());
+    for (char c : k)
     {
-        if (argc < 2)
-            throw std::runtime_error("missing argument");
+        if (!std::isspace(static_cast<unsigned char>(c)))
+            compact.push_back(c);
+    }
+    return compact == "time(s)" || compact == "time[s]";
+}
 
-        const std::filesystem::path firstArg = stripFileUrl(argv[1]);
-        if (isExistingDirectory(firstArg))
+bool isAuxiliarySkipHeader(const std::string& header)
+{
+    const std::string k = asciiLowerCopy(header);
+    return k == "rowid" || k == "row_id" || k == "rowindex" || k == "row_index";
+}
+
+std::size_t findTimeColumnIndex(const std::vector<std::string>& headers)
+{
+    for (std::size_t i = 0; i < headers.size(); ++i)
+    {
+        if (isTimeColumnHeader(headers[i]))
+            return i;
+    }
+    return 0;
+}
+
+CsvData readCsv(const std::string& path)
+{
+    std::ifstream fin(path);
+    if (!fin)
+        throw std::runtime_error("Cannot open input CSV: " + path);
+
+    std::string line;
+    if (!std::getline(fin, line))
+        throw std::runtime_error("CSV is empty");
+
+    CsvData data;
+    data.headers = splitCsvLine(line);
+    if (data.headers.empty())
+        throw std::runtime_error("CSV header is empty");
+
+    data.columns.resize(data.headers.size());
+
+    std::size_t row = 0;
+    while (std::getline(fin, line))
+    {
+        ++row;
+        if (line.empty())
+            continue;
+
+        auto fields = splitCsvLine(line);
+        if (fields.size() < data.headers.size())
+            fields.resize(data.headers.size());
+
+        bool anyValid = false;
+        std::vector<double> parsed(data.headers.size(), std::numeric_limits<double>::quiet_NaN());
+
+        for (std::size_t c = 0; c < data.headers.size(); ++c)
         {
-            RunPaths paths;
-            paths.inputCsv = resolveDecimatedCsv(firstArg);
-            paths.outputLog = (firstArg / "output.log").string();
-            if (argc >= 3)
-                paths.targetFundamentalHz = std::stod(argv[2]);
-            if (argc >= 4)
-                paths.maxHarmonic = std::stoi(argv[3]);
-            if (argc >= 5)
-                throw std::runtime_error("too many arguments for folder mode");
-            return paths;
+            if (auto v = parseDouble(fields[c]); v.has_value())
+            {
+                parsed[c] = *v;
+                anyValid = true;
+            }
         }
 
-        if (argc < 3)
-            throw std::runtime_error("missing output log path");
+        if (!anyValid)
+            continue;
 
+        for (std::size_t c = 0; c < data.headers.size(); ++c)
+            data.columns[c].push_back(parsed[c]);
+    }
+
+    if (data.columns.empty() || data.columns[0].empty())
+        throw std::runtime_error("No numeric rows found in CSV");
+
+    return data;
+}
+
+double estimateDt(const std::vector<double>& t)
+{
+    if (t.size() < 2)
+        throw std::runtime_error("Need at least 2 time samples");
+
+    std::vector<double> dts;
+    dts.reserve(t.size() - 1);
+    for (std::size_t i = 1; i < t.size(); ++i)
+    {
+        const double dt = t[i] - t[i - 1];
+        if (std::isfinite(dt) && dt > 0)
+            dts.push_back(dt);
+    }
+
+    if (dts.empty())
+        throw std::runtime_error("Invalid time axis");
+
+    std::ranges::sort(dts);
+    return dts[dts.size() / 2];
+}
+
+ChannelStats analyzeChannel(
+    const std::string& name,
+    const std::vector<double>& time,
+    const std::vector<double>& raw,
+    double fs,
+    double targetFundamentalHz,
+    int maxHarmonic)
+{
+    ChannelStats s;
+    s.name = name;
+
+    s.mean = mean(raw);
+    s.rms = rms(raw);
+    s.stddev = stddev(raw, s.mean);
+    s.minv = minValue(raw);
+    s.maxv = maxValue(raw);
+    s.p2p = s.maxv - s.minv;
+    s.crestFactor = (s.rms > 0.0) ? std::max(std::abs(s.minv), std::abs(s.maxv)) / s.rms : 0.0;
+
+    s.detrended = detrendDc(raw, s.mean);
+    s.zeroCrossingTime = estimateZeroCrossingTime(time, s.detrended);
+
+    const auto fft = computeRfft(s.detrended, fs);
+
+    s.fundamentalHz = targetFundamentalHz;
+    s.fundamentalBin = nearestBin(fft, targetFundamentalHz);
+    s.fundamentalAmplitude = binAmplitudePeak(fft, s.fundamentalBin);
+    s.fundamentalPhaseRad = binPhaseRad(fft, s.fundamentalBin);
+    s.fundamentalPhaseDeg = radToDeg(s.fundamentalPhaseRad);
+
+    s.dominantBin = dominantBinIgnoringDc(fft);
+    s.dominantFreqHz = binFrequency(fft, s.dominantBin);
+    s.dominantAmplitude = binAmplitudePeak(fft, s.dominantBin);
+
+    s.harmonics.resize(static_cast<std::size_t>(maxHarmonic + 1));
+    double harmonicPowerWithoutFundamental = 0.0;
+    double totalPower = 0.0;
+
+    for (int k = 1; k < static_cast<int>(fft.bins.size()); ++k)
+    {
+        const double a = binAmplitudePeak(fft, k);
+        totalPower += a * a;
+    }
+
+    for (int h = 1; h <= maxHarmonic; ++h)
+    {
+        const double f = targetFundamentalHz * static_cast<double>(h);
+        const int bin = nearestBin(fft, f);
+        HarmonicInfo hi;
+        hi.harmonic = h;
+        hi.freqHz = binFrequency(fft, bin);
+        hi.fftBin = bin;
+        hi.amplitude = binAmplitudePeak(fft, bin);
+        hi.phaseRad = binPhaseRad(fft, bin);
+        hi.phaseDeg = radToDeg(hi.phaseRad);
+        hi.relToFundamental = (s.fundamentalAmplitude > 0.0) ? hi.amplitude / s.fundamentalAmplitude : 0.0;
+        s.harmonics[static_cast<std::size_t>(h)] = hi;
+
+        if (h >= 2)
+            harmonicPowerWithoutFundamental += hi.amplitude * hi.amplitude;
+    }
+
+    s.totalSpectralEnergy = totalPower;
+    s.harmonicEnergy = harmonicPowerWithoutFundamental;
+    s.fundamentalEnergyRatio = (totalPower > 0.0) ? (s.fundamentalAmplitude * s.fundamentalAmplitude) / totalPower : 0.0;
+    s.thd = (s.fundamentalAmplitude > 0.0) ? std::sqrt(harmonicPowerWithoutFundamental) / s.fundamentalAmplitude : 0.0;
+
+    const auto fit = buildBestFitSine(s.detrended.size(), fs, targetFundamentalHz, s.fundamentalAmplitude, s.fundamentalPhaseRad);
+    s.sineResidual = residual(s.detrended, fit);
+    s.sineResidualRMS = rms(s.sineResidual);
+    s.sineResidualToSignalRMS = (rms(s.detrended) > 0.0) ? s.sineResidualRMS / rms(s.detrended) : 0.0;
+    s.sineResidualToSignalStd = (s.stddev > 0.0) ? stddev(s.sineResidual, mean(s.sineResidual)) / s.stddev : 0.0;
+
+    return s;
+}
+
+PairStats analyzePair(
+    const ChannelStats& a,
+    const ChannelStats& b,
+    double fs,
+    double fundamentalHz)
+{
+    PairStats p;
+    p.a = a.name;
+    p.b = b.name;
+
+    p.pearsonCorrelation = pearsonCorrelation(a.detrended, b.detrended);
+    p.normalizedDot = normalizedDot(a.detrended, b.detrended);
+    p.amplitudeRatio = (b.rms > 0.0) ? a.rms / b.rms : 0.0;
+
+    p.phaseDiffRad = wrapPhasePi(b.fundamentalPhaseRad - a.fundamentalPhaseRad);
+    p.phaseDiffDeg = radToDeg(p.phaseDiffRad);
+    p.timeShiftSec = degToTimeSec(p.phaseDiffDeg, fundamentalHz);
+    p.timeShiftUs = p.timeShiftSec * 1e6;
+
+    const int maxLag = std::max(1, static_cast<int>(std::llround(fs / fundamentalHz * 0.5)));
+    auto [lag, score] = bestCrossCorrelationLag(a.detrended, b.detrended, maxLag);
+    p.bestLagSamples = lag;
+    p.bestLagSec = static_cast<double>(lag) / fs;
+    p.bestLagUs = p.bestLagSec * 1e6;
+    p.bestLagCorrelation = score;
+
+    const auto shiftedB = shiftSignal(b.detrended, lag);
+    p.alignedCorrelation = pearsonCorrelation(a.detrended, shiftedB);
+
+    p.harmonicSimilarity = harmonicSimilarity(a.harmonics, b.harmonics);
+    p.residualCorrelation = pearsonCorrelation(a.sineResidual, b.sineResidual);
+
+    return p;
+}
+
+AnalysisResult analyzeCsv(const CsvData& csv, const AnalysisOptions& options)
+{
+    validateAnalysisOptions(options);
+
+    if (csv.headers.size() < 2)
+        throw std::runtime_error("Need at least time column + one signal column");
+
+    AnalysisResult result;
+    result.csv = csv;
+    result.timeColumnIndex = findTimeColumnIndex(csv.headers);
+
+    const auto& time = csv.columns[result.timeColumnIndex];
+    if (!isFiniteVector(time))
+        throw std::runtime_error("Time column contains non-finite values");
+
+    result.dt = estimateDt(time);
+    result.fs = 1.0 / result.dt;
+    result.duration = time.back() - time.front();
+    result.rowCount = time.size();
+
+    for (std::size_t c = 0; c < csv.headers.size(); ++c)
+    {
+        if (c == result.timeColumnIndex)
+            continue;
+        if (isAuxiliarySkipHeader(csv.headers[c]))
+            continue;
+
+        const auto& col = csv.columns[c];
+        if (col.size() != time.size())
+            continue;
+        if (!isFiniteVector(col))
+            continue;
+
+        result.channels.push_back(analyzeChannel(
+            csv.headers[c], time, col, result.fs,
+            options.targetFundamentalHz, options.maxHarmonic));
+    }
+
+    if (result.channels.empty())
+        throw std::runtime_error("No valid numeric signal channels found");
+
+    for (std::size_t i = 0; i < result.channels.size(); ++i)
+    {
+        for (std::size_t j = i + 1; j < result.channels.size(); ++j)
+        {
+            result.pairs.push_back(analyzePair(
+                result.channels[i], result.channels[j],
+                result.fs, options.targetFundamentalHz));
+        }
+    }
+
+    return result;
+}
+
+AnalysisResult analyzeCsvFile(const std::string& path, const AnalysisOptions& options)
+{
+    return analyzeCsv(readCsv(path), options);
+}
+
+void writeChannelReport(std::ostream& os, const ChannelStats& s)
+{
+    writeSeparator(os);
+    os << "CHANNEL: " << s.name << "\n";
+    writeSeparator(os, '-');
+
+    os << std::fixed << std::setprecision(9);
+    os << "Mean/DC                     : " << s.mean << "\n";
+    os << "RMS                         : " << s.rms << "\n";
+    os << "StdDev                      : " << s.stddev << "\n";
+    os << "Min                         : " << s.minv << "\n";
+    os << "Max                         : " << s.maxv << "\n";
+    os << "Peak-to-peak                : " << s.p2p << "\n";
+    os << "Crest factor                : " << s.crestFactor << "\n";
+    os << "\n";
+
+    os << "Dominant FFT bin            : " << s.dominantBin << "\n";
+    os << "Dominant frequency [Hz]     : " << s.dominantFreqHz << "\n";
+    os << "Dominant amplitude          : " << s.dominantAmplitude << "\n";
+    os << "\n";
+
+    os << "Target fundamental [Hz]     : " << s.fundamentalHz << "\n";
+    os << "Fundamental bin             : " << s.fundamentalBin << "\n";
+    os << "Fundamental amplitude       : " << s.fundamentalAmplitude << "\n";
+    os << "Fundamental phase [rad]     : " << s.fundamentalPhaseRad << "\n";
+    os << "Fundamental phase [deg]     : " << s.fundamentalPhaseDeg << "\n";
+    os << "\n";
+
+    os << "THD                         : " << s.thd << "\n";
+    os << "Total spectral energy       : " << s.totalSpectralEnergy << "\n";
+    os << "Harmonic energy (2..N)      : " << s.harmonicEnergy << "\n";
+    os << "Fundamental energy ratio    : " << s.fundamentalEnergyRatio << "\n";
+    os << "\n";
+
+    os << "Sine residual RMS           : " << s.sineResidualRMS << "\n";
+    os << "Residual / signal RMS       : " << s.sineResidualToSignalRMS << "\n";
+    os << "Residual / signal StdDev    : " << s.sineResidualToSignalStd << "\n";
+    os << "\n";
+
+    if (std::isfinite(s.zeroCrossingTime))
+        os << "First rising zero-cross [s] : " << s.zeroCrossingTime << "\n";
+    else
+        os << "First rising zero-cross [s] : n/a\n";
+
+    os << "\n";
+    os << "HARMONICS\n";
+    writeSeparator(os, '.');
+    os << "H  "
+       << std::setw(14) << "Freq[Hz]"
+       << std::setw(12) << "Bin"
+       << std::setw(18) << "Amplitude"
+       << std::setw(18) << "Phase[deg]"
+       << std::setw(18) << "Rel/Fund"
+       << "\n";
+
+    for (std::size_t h = 1; h < s.harmonics.size(); ++h)
+    {
+        const auto& hi = s.harmonics[h];
+        os << std::setw(2) << hi.harmonic
+           << std::setw(14) << hi.freqHz
+           << std::setw(12) << hi.fftBin
+           << std::setw(18) << hi.amplitude
+           << std::setw(18) << hi.phaseDeg
+           << std::setw(18) << hi.relToFundamental
+           << "\n";
+    }
+    os << "\n";
+}
+
+void writePairReport(std::ostream& os, const PairStats& p)
+{
+    writeSeparator(os);
+    os << "PAIR: " << p.a << "  <->  " << p.b << "\n";
+    writeSeparator(os, '-');
+
+    os << std::fixed << std::setprecision(9);
+    os << "Pearson correlation         : " << p.pearsonCorrelation << "\n";
+    os << "Normalized dot              : " << p.normalizedDot << "\n";
+    os << "Amplitude ratio A/B         : " << p.amplitudeRatio << "\n";
+    os << "\n";
+
+    os << "Phase diff [rad]            : " << p.phaseDiffRad << "\n";
+    os << "Phase diff [deg]            : " << p.phaseDiffDeg << "\n";
+    os << "Time shift [s]              : " << p.timeShiftSec << "\n";
+    os << "Time shift [us]             : " << p.timeShiftUs << "\n";
+    os << "\n";
+
+    os << "Best cross-corr lag [samp]  : " << p.bestLagSamples << "\n";
+    os << "Best cross-corr lag [s]     : " << p.bestLagSec << "\n";
+    os << "Best cross-corr lag [us]    : " << p.bestLagUs << "\n";
+    os << "Best cross-corr score       : " << p.bestLagCorrelation << "\n";
+    os << "Aligned correlation         : " << p.alignedCorrelation << "\n";
+    os << "\n";
+
+    os << "Harmonic similarity         : " << p.harmonicSimilarity << "\n";
+    os << "Residual correlation        : " << p.residualCorrelation << "\n";
+    os << "\n";
+}
+
+void writeAnalysisReport(std::ostream& log, const AnalysisResult& result, const ReportOptions& report)
+{
+    const auto& csv = result.csv;
+
+    writeSeparator(log);
+    log << "OSCILLOSCOPE CSV ANALYSIS REPORT\n";
+    writeSeparator(log);
+    log << "Input file                  : " << report.inputFile << "\n";
+    log << "Output log                  : " << report.outputLog << "\n";
+    log << "Generated                   : " << nowString() << "\n";
+    log << "\n";
+
+    log << std::fixed << std::setprecision(9);
+    log << "Rows                        : " << result.rowCount << "\n";
+    log << "Duration [s]                : " << result.duration << "\n";
+    log << "Estimated dt [s]            : " << result.dt << "\n";
+    log << "Estimated Fs [Hz]           : " << result.fs << "\n";
+    log << "Target fundamental [Hz]     : " << report.targetFundamentalHz << "\n";
+    log << "Max harmonic                : " << report.maxHarmonic << "\n";
+    log << "Time column                 : " << csv.headers[result.timeColumnIndex]
+        << " (column " << result.timeColumnIndex << ")\n";
+    log << "Signal channels             : " << result.channels.size() << "\n";
+    log << "\n";
+
+    writeSeparator(log);
+    log << "CHANNEL LIST\n";
+    writeSeparator(log, '-');
+    for (const auto& ch : result.channels)
+        log << " - " << ch.name << "\n";
+    log << "\n";
+
+    for (const auto& ch : result.channels)
+        writeChannelReport(log, ch);
+
+    writeSeparator(log);
+    log << "PAIRWISE ANALYSIS\n";
+    writeSeparator(log);
+    for (const auto& p : result.pairs)
+        writePairReport(log, p);
+
+    writeSeparator(log);
+    log << "SUMMARY HINTS\n";
+    writeSeparator(log, '-');
+
+    for (const auto& p : result.pairs)
+    {
+        log << p.a << " vs " << p.b << ":\n";
+        log << "  Phase diff [deg]          : " << p.phaseDiffDeg << "\n";
+        log << "  Time shift [us]           : " << p.timeShiftUs << "\n";
+        log << "  Pearson corr              : " << p.pearsonCorrelation << "\n";
+        log << "  Aligned corr              : " << p.alignedCorrelation << "\n";
+        log << "  Harmonic similarity       : " << p.harmonicSimilarity << "\n";
+        log << "  Residual correlation      : " << p.residualCorrelation << "\n";
+
+        if (std::abs(p.phaseDiffDeg) < 2.0 &&
+            p.alignedCorrelation > 0.98 &&
+            p.harmonicSimilarity > 0.9)
+        {
+            log << "  Verdict                   : very similar waveform and nearly phase aligned\n";
+        }
+        else if (p.alignedCorrelation > 0.9 && p.harmonicSimilarity > 0.8)
+        {
+            log << "  Verdict                   : similar shape, possible moderate phase/amplitude offset\n";
+        }
+        else
+        {
+            log << "  Verdict                   : waveform family likely different or strongly distorted\n";
+        }
+        log << "\n";
+    }
+}
+
+std::string stripFileUrl(std::string path)
+{
+    constexpr std::string_view prefix = "file://";
+    if (path.starts_with(prefix))
+        path.erase(0, prefix.size());
+    return path;
+}
+
+std::string resolveDecimatedCsv(const std::filesystem::path& dir)
+{
+    static constexpr std::array<const char*, 2> candidates = {"_decimated.csv", "decimated.csv"};
+    for (const char* name : candidates)
+    {
+        const auto candidate = dir / name;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec))
+            return candidate.string();
+    }
+    throw std::runtime_error(
+        "No decimated CSV in folder: expected _decimated.csv or decimated.csv in " + dir.string());
+}
+
+RunPaths parseRunPaths(int argc, char** argv)
+{
+    if (argc < 2)
+        throw std::runtime_error("missing argument");
+
+    const std::filesystem::path firstArg = stripFileUrl(argv[1]);
+    if (isExistingDirectory(firstArg))
+    {
         RunPaths paths;
-        paths.inputCsv = argv[1];
-        paths.outputLog = argv[2];
+        paths.inputCsv = resolveDecimatedCsv(firstArg);
+        paths.outputLog = (firstArg / "output.log").string();
+        if (argc >= 3)
+            paths.targetFundamentalHz = std::stod(argv[2]);
         if (argc >= 4)
-            paths.targetFundamentalHz = std::stod(argv[3]);
+            paths.maxHarmonic = std::stoi(argv[3]);
         if (argc >= 5)
-            paths.maxHarmonic = std::stoi(argv[4]);
-        if (argc >= 6)
-            throw std::runtime_error("too many arguments");
+            throw std::runtime_error("too many arguments for folder mode");
         return paths;
     }
 
-    static void printUsage(const char* program)
-    {
-        std::cerr
-            << "Usage:\n"
-            << "  " << program << " <capture_folder> [fundamental_hz] [max_harmonic]\n"
-            << "  " << program << " <input.csv> <output.log> [fundamental_hz] [max_harmonic]\n"
-            << "\n"
-            << "Folder mode reads <folder>/_decimated.csv or <folder>/decimated.csv\n"
-            << "and writes <folder>/output.log\n";
-    }
+    if (argc < 3)
+        throw std::runtime_error("missing output log path");
+
+    RunPaths paths;
+    paths.inputCsv = argv[1];
+    paths.outputLog = argv[2];
+    if (argc >= 4)
+        paths.targetFundamentalHz = std::stod(argv[3]);
+    if (argc >= 5)
+        paths.maxHarmonic = std::stoi(argv[4]);
+    if (argc >= 6)
+        throw std::runtime_error("too many arguments");
+    return paths;
 }
 
-int main(int argc, char** argv)
+void printUsage(const char* program)
 {
-    try
-    {
-        RunPaths paths;
-        try
-        {
-            paths = parseRunPaths(argc, argv);
-        }
-        catch (const std::runtime_error& e)
-        {
-            if (std::string_view(e.what()) == "missing argument" ||
-                std::string_view(e.what()) == "missing output log path")
-            {
-                printUsage(argv[0]);
-                return 1;
-            }
-            throw;
-        }
-
-        const std::string& inputCsv = paths.inputCsv;
-        const std::string& outputLog = paths.outputLog;
-        const double targetFundamentalHz = paths.targetFundamentalHz;
-        const int maxHarmonic = paths.maxHarmonic;
-
-        if (targetFundamentalHz <= 0.0)
-            throw std::runtime_error("fundamental_hz must be > 0");
-
-        if (maxHarmonic < 1)
-            throw std::runtime_error("max_harmonic must be >= 1");
-
-        const CsvData csv = readCsv(inputCsv);
-        if (csv.headers.size() < 2)
-            throw std::runtime_error("Need at least time column + one signal column");
-
-        const std::size_t timeIdx = findTimeColumnIndex(csv.headers);
-        const auto& time = csv.columns[timeIdx];
-        if (!isFiniteVector(time))
-            throw std::runtime_error("Time column contains non-finite values");
-
-        const double dt = estimateDt(time);
-        const double fs = 1.0 / dt;
-        const double duration = (time.back() - time.front());
-        const std::size_t N = time.size();
-
-        std::vector<ChannelStats> channels;
-        for (std::size_t c = 0; c < csv.headers.size(); ++c)
-        {
-            if (c == timeIdx)
-                continue;
-            if (isAuxiliarySkipHeader(csv.headers[c]))
-                continue;
-
-            const auto& col = csv.columns[c];
-            if (col.size() != time.size())
-                continue;
-            if (!isFiniteVector(col))
-                continue;
-
-            channels.push_back(analyzeChannel(csv.headers[c], time, col, fs, targetFundamentalHz, maxHarmonic));
-        }
-
-        if (channels.empty())
-            throw std::runtime_error("No valid numeric signal channels found");
-
-        std::vector<PairStats> pairs;
-        for (std::size_t i = 0; i < channels.size(); ++i)
-        {
-            for (std::size_t j = i + 1; j < channels.size(); ++j)
-                pairs.push_back(analyzePair(channels[i], channels[j], fs, targetFundamentalHz));
-        }
-
-        std::ofstream log(outputLog);
-        if (!log)
-            throw std::runtime_error("Cannot open output log: " + outputLog);
-
-        writeSeparator(log);
-        log << "OSCILLOSCOPE CSV ANALYSIS REPORT\n";
-        writeSeparator(log);
-        log << "Input file                  : " << inputCsv << "\n";
-        log << "Output log                  : " << outputLog << "\n";
-        log << "Generated                   : " << nowString() << "\n";
-        log << "\n";
-
-        log << std::fixed << std::setprecision(9);
-        log << "Rows                        : " << N << "\n";
-        log << "Duration [s]                : " << duration << "\n";
-        log << "Estimated dt [s]            : " << dt << "\n";
-        log << "Estimated Fs [Hz]           : " << fs << "\n";
-        log << "Target fundamental [Hz]     : " << targetFundamentalHz << "\n";
-        log << "Max harmonic                : " << maxHarmonic << "\n";
-        log << "Time column                 : " << csv.headers[timeIdx] << " (column " << timeIdx << ")\n";
-        log << "Signal channels             : " << channels.size() << "\n";
-        log << "\n";
-
-        writeSeparator(log);
-        log << "CHANNEL LIST\n";
-        writeSeparator(log, '-');
-        for (const auto& ch : channels)
-            log << " - " << ch.name << "\n";
-        log << "\n";
-
-        for (const auto& ch : channels)
-            writeChannelReport(log, ch);
-
-        writeSeparator(log);
-        log << "PAIRWISE ANALYSIS\n";
-        writeSeparator(log);
-        for (const auto& p : pairs)
-            writePairReport(log, p);
-
-        writeSeparator(log);
-        log << "SUMMARY HINTS\n";
-        writeSeparator(log, '-');
-
-        for (const auto& p : pairs)
-        {
-            log << p.a << " vs " << p.b << ":\n";
-            log << "  Phase diff [deg]          : " << p.phaseDiffDeg << "\n";
-            log << "  Time shift [us]           : " << p.timeShiftUs << "\n";
-            log << "  Pearson corr              : " << p.pearsonCorrelation << "\n";
-            log << "  Aligned corr              : " << p.alignedCorrelation << "\n";
-            log << "  Harmonic similarity       : " << p.harmonicSimilarity << "\n";
-            log << "  Residual correlation      : " << p.residualCorrelation << "\n";
-
-            if (std::abs(p.phaseDiffDeg) < 2.0 &&
-                p.alignedCorrelation > 0.98 &&
-                p.harmonicSimilarity > 0.9)
-            {
-                log << "  Verdict                   : very similar waveform and nearly phase aligned\n";
-            }
-            else if (p.alignedCorrelation > 0.9 && p.harmonicSimilarity > 0.8)
-            {
-                log << "  Verdict                   : similar shape, possible moderate phase/amplitude offset\n";
-            }
-            else
-            {
-                log << "  Verdict                   : waveform family likely different or strongly distorted\n";
-            }
-            log << "\n";
-        }
-
-        std::cout << "Analysis complete. Log written to: " << outputLog << "\n";
-        return 0;
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "ERROR: " << e.what() << "\n";
-        return 2;
-    }
+    std::cerr
+        << "Usage:\n"
+        << "  " << program << " <capture_folder> [fundamental_hz] [max_harmonic]\n"
+        << "  " << program << " <input.csv> <output.log> [fundamental_hz] [max_harmonic]\n"
+        << "\n"
+        << "Folder mode reads <folder>/_decimated.csv or <folder>/decimated.csv\n"
+        << "and writes <folder>/output.log\n";
 }
+
+} // namespace scope_analyzer

@@ -8,7 +8,7 @@ BIN="$ROOT/scope_analyzer"
 
 if [[ ! -x "$BIN" ]]; then
     echo "analyze_capture.sh: build scope_analyzer first:" >&2
-    echo "  g++ -std=c++20 -O2 -Wall -Wextra -o scope_analyzer scope_analyzer.cpp -lfftw3" >&2
+    echo "  g++ -std=c++20 -O2 -Wall -Wextra -o scope_analyzer scope_analyzer.cpp scope_analyzer_main.cpp -lfftw3" >&2
     exit 1
 fi
 
