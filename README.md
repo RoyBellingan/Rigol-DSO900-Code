@@ -8,6 +8,9 @@ Tools for downloading **deep-memory waveforms** from **Rigol DHO800/DHO900-serie
 g++ -std=c++20 -O2 -Wall -Wextra -o scope_download \
     scope_download.cpp scope_download_main.cpp scope_analyzer.cpp -lfftw3 -pthread
 
+source myenv/bin/activate
+pip install -r requirements.txt
+
 ./scope_download              # all channels 1-4
 ./scope_download 1 3          # CHAN1 and CHAN3 only
 ./scope_download --channels 1,3,4 --no-plots
@@ -30,6 +33,9 @@ Output goes to `aq_YYYY-MM-DD_HHMMSS/` with CSVs, PNG checks, screenshot, and **
 | `--reset-pause` | `0.5` | Pause between channel reads (firmware workaround) |
 | `--out-prefix` | *(empty)* | File prefix (`_CHAN1.csv`, etc.) |
 | `--out-dir-prefix` | `aq_` | Output folder prefix |
+| `--no-raw` | off | Skip per-channel full-depth `_*CHAN*.csv` |
+| `--no-aligned` | off | Skip `*_aligned.csv` |
+| `--xzDecimated` | off | Compress `_decimated.csv` with `xz -6` (removes `.csv`; runs after analysis/plots) |
 | `--no-plots` | off | Skip `_CHAN*_check.png` |
 | `--no-screenshot` | off | Skip `screenshot.png` |
 | `--no-analysis` | off | Skip `output.log` (FFT report) |

@@ -594,6 +594,30 @@ void saveDecimatedCsv(
     std::cout << "Saved " << path << "  (" << idxs.size() << " rows)\n";
 }
 
+[[nodiscard]] std::filesystem::path decimatedCsvPath(
+    const std::filesystem::path& outDir,
+    const std::string& prefix)
+{
+    return outDir / (prefix + "_decimated.csv");
+}
+
+void xzCompressDecimatedCsv(const std::filesystem::path& csvPath)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(csvPath, ec))
+        throw std::runtime_error("Decimated CSV not found for xz: " + csvPath.string());
+
+    std::ostringstream cmd;
+    cmd << "xz -6 -f \"" << csvPath.string() << "\"";
+    std::cout << "Compressing " << csvPath.filename() << " with xz -6...\n";
+    const int rc = std::system(cmd.str().c_str());
+    if (rc != 0)
+        throw std::runtime_error("xz failed (exit " + std::to_string(rc) + ") on " + csvPath.string());
+
+    const auto xzPath = csvPath.string() + ".xz";
+    std::cout << "Saved " << xzPath << "\n";
+}
+
 void saveScreenshot(TcpScpiSession& scope, const std::filesystem::path& outDir, const std::string& prefix)
 {
     std::cout << "Capturing screenshot...\n";
@@ -836,10 +860,15 @@ DownloadResult runDownload(const DownloadConfig& config)
         }
     }
 
-    for (const auto& wf : result.waveforms)
-        saveSingleChannelCsv(wf, result.refWaveform, config.outPrefix, result.outDir);
+    if (config.saveRawCsv)
+    {
+        for (const auto& wf : result.waveforms)
+            saveSingleChannelCsv(wf, result.refWaveform, config.outPrefix, result.outDir);
+    }
 
-    saveAlignedCsv(result.waveforms, result.refWaveform, config.outPrefix, result.outDir);
+    if (config.saveAlignedCsv)
+        saveAlignedCsv(result.waveforms, result.refWaveform, config.outPrefix, result.outDir);
+
     saveDecimatedCsv(
         result.waveforms, result.refWaveform, config.outPrefix, result.outDir, config.outputPoints);
 
@@ -855,6 +884,9 @@ DownloadResult runDownload(const DownloadConfig& config)
 
     if (config.plots)
         runPlotChecks(result.outDir, config.outPrefix, config.channels);
+
+    if (config.xzDecimated)
+        xzCompressDecimatedCsv(decimatedCsvPath(result.outDir, config.outPrefix));
 
     if (config.screenshot)
         saveScreenshot(scope, result.outDir, config.outPrefix);
@@ -901,6 +933,12 @@ DownloadConfig parseArgs(int argc, char** argv)
                 cfg.outPrefix = needValue("--out-prefix");
             else if (arg == "--out-dir-prefix")
                 cfg.outDirPrefix = needValue("--out-dir-prefix");
+            else if (arg == "--no-raw")
+                cfg.saveRawCsv = false;
+            else if (arg == "--no-aligned")
+                cfg.saveAlignedCsv = false;
+            else if (arg == "--xzDecimated")
+                cfg.xzDecimated = true;
             else if (arg == "--no-plots")
                 cfg.plots = false;
             else if (arg == "--no-screenshot")
@@ -956,6 +994,9 @@ void printUsage(const char* program)
         << "  --reset-pause SEC    Pause between channel reads (default: 0.5)\n"
         << "  --out-prefix PREFIX  Output file prefix (default: empty -> _CHAN1.csv)\n"
         << "  --out-dir-prefix P   Output folder prefix (default: aq_)\n"
+        << "  --no-raw             Skip per-channel full-depth CSVs\n"
+        << "  --no-aligned         Skip time-aligned multi-channel CSV\n"
+        << "  --xzDecimated        Compress _decimated.csv with xz -6 (after analysis/plots)\n"
         << "  --no-plots           Skip verification PNGs\n"
         << "  --no-screenshot      Skip display screenshot\n"
         << "  --no-analysis        Skip FFT report (output.log)\n"

@@ -18,6 +18,9 @@ struct DownloadConfig
     std::size_t chunkPoints = 250'000;
     std::size_t outputPoints = 10'000;
     double resetPauseSec = 0.5;
+    bool saveRawCsv = true;
+    bool saveAlignedCsv = true;
+    bool xzDecimated = false;
     bool plots = true;
     bool screenshot = true;
     bool analysis = true;
