@@ -103,7 +103,7 @@ v = raw * scale + offset
 | `--format` | `word` | Transfer width: `word` = 12-bit (full digitizer resolution), `byte` = 8-bit |
 | `--byte` | off | Shorthand for `--format byte` |
 | `--word-order` | `auto` | WORD byte order: `auto`, `le`, `be` |
-| `--chunk` | `250000` byte / `125000` word | Samples per `:WAV:DATA?` request |
+| `--chunk` | `250000` | Samples per `:WAV:DATA?` request (WORD and BYTE) |
 | `--decimate` | `10000` | Row count for `_decimated.csv` |
 | `--clip-tolerance` | `0.5` | Percent of samples allowed on a rail before warning and exit 1 |
 | `--reset-pause` | `0.5` | Pause between channel reads (firmware workaround) |
@@ -111,7 +111,7 @@ v = raw * scale + offset
 | `--out-dir-prefix` | `aq_` | Output folder prefix |
 | `--csv` | off | Also write per-channel full-depth `_*CHAN*.csv` |
 | `--no-raw` | off | Skip per-channel int16 `.bin` + `.json` (independent of `--csv`) |
-| `--no-aligned` | off | Skip `*_aligned.csv` |
+| `--no-aligned` | off | Skip `*_aligned.csv` (also skipped automatically with one channel) |
 | `--xzDecimated` | off | Compress `_decimated.csv` with `xz -6` (removes `.csv`; runs after analysis/plots) |
 | `--no-plots` | off | Skip `_CHAN*_check.png` |
 | `--no-screenshot` | off | Skip `screenshot.png` |

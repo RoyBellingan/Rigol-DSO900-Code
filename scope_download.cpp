@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -30,7 +31,8 @@ namespace
 {
 
 constexpr int kTimeoutSec = 180;
-constexpr int kRecvBufSize = 1024 * 1024;
+constexpr int kRecvBufSize = 4 * 1024 * 1024;
+constexpr int kReadChunkSize = 256 * 1024;
 // WORD codes span 0..65535. Stored int16 is code - kCodeBias so np.int16 can hold them.
 constexpr int kCodeBias = 32768;
 
@@ -99,6 +101,8 @@ public:
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kRecvBufSize, sizeof(kRecvBufSize));
+        const int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         fd_ = fd;
     }
@@ -167,7 +171,7 @@ private:
     {
         while (buf.size() < need)
         {
-            std::array<std::uint8_t, 65536> chunk{};
+            std::array<std::uint8_t, kReadChunkSize> chunk{};
             const ssize_t n = ::recv(fd_, chunk.data(), chunk.size(), 0);
             if (n <= 0)
                 throw std::runtime_error("SCPI recv failed or timed out");
@@ -182,7 +186,7 @@ private:
         {
             if (readBuf_.empty())
             {
-                std::array<std::uint8_t, 65536> chunk{};
+                std::array<std::uint8_t, kReadChunkSize> chunk{};
                 const ssize_t n = ::recv(fd_, chunk.data(), chunk.size(), 0);
                 if (n <= 0)
                     throw std::runtime_error("SCPI recv failed or timed out");
@@ -229,7 +233,9 @@ private:
             throw std::runtime_error("Invalid binary block length: " + lenStr);
         }
 
-        recvSome(buf, 2 + static_cast<std::size_t>(ndigits) + payloadLen);
+        const std::size_t headerLen = 2 + static_cast<std::size_t>(ndigits);
+        buf.reserve(headerLen + payloadLen);
+        recvSome(buf, headerLen + payloadLen);
         std::vector<std::uint8_t> payload(
             buf.begin() + 2 + ndigits,
             buf.begin() + 2 + ndigits + static_cast<std::ptrdiff_t>(payloadLen));
@@ -430,17 +436,19 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
     while (start <= points)
     {
         const int stop = std::min(start + static_cast<int>(chunkPoints) - 1, points);
-        scope.writeCmd(":WAV:STAR " + std::to_string(start));
-        scope.writeCmd(":WAV:STOP " + std::to_string(stop));
-        scope.drainErrors("WAV:STAR/STOP " + std::to_string(start) + ".." + std::to_string(stop));
+        // One write, no per-chunk :SYST:ERR? — those extra round trips dominate
+        // the transfer. A short or rejected chunk still fails the size check below.
+        scope.writeCmd(":WAV:STAR " + std::to_string(start)
+                       + ";:WAV:STOP " + std::to_string(stop));
 
         const auto raw = scope.queryBinaryBlock(":WAV:DATA?");
-        scope.drainErrors("WAV:DATA? " + channel + " " + std::to_string(start) + ".." + std::to_string(stop));
 
         const std::size_t expectedPoints = static_cast<std::size_t>(stop - start + 1);
         const std::size_t expectedBytes = expectedPoints * bytesPerPoint;
         if (raw.size() != expectedBytes)
         {
+            scope.drainErrors("WAV:DATA? size mismatch " + channel + " "
+                              + std::to_string(start) + ".." + std::to_string(stop));
             throw std::runtime_error(
                 channel + ": expected " + std::to_string(expectedBytes) + " bytes ("
                 + std::to_string(expectedPoints) + " points x " + std::to_string(bytesPerPoint)
@@ -475,6 +483,8 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
                   << std::flush;
         start = stop + 1;
     }
+
+    scope.drainErrors("WAV:DATA? " + channel);
 
     wf.points = wf.values.size();
     wf.resolvedOrder = order;
@@ -1122,8 +1132,10 @@ DownloadResult runDownload(const DownloadConfig& config)
             saveSingleChannelCsv(wf, result.refWaveform, config.outPrefix, result.outDir);
     }
 
-    if (config.saveAlignedCsv)
+    if (config.saveAlignedCsv && result.waveforms.size() > 1)
         saveAlignedCsv(result.waveforms, result.refWaveform, config.outPrefix, result.outDir);
+    else if (config.saveAlignedCsv)
+        std::cout << "Skipping aligned CSV (single channel)\n";
 
     saveDecimatedCsv(
         result.waveforms, result.refWaveform, config.outPrefix, result.outDir, config.outputPoints);
@@ -1173,7 +1185,6 @@ DownloadConfig parseArgs(int argc, char** argv)
 {
     DownloadConfig cfg;
     bool channelsFromFlag = false;
-    bool chunkFromFlag = false;
     std::vector<std::string> positionalChannels;
 
     for (int i = 1; i < argc; ++i)
@@ -1199,10 +1210,7 @@ DownloadConfig parseArgs(int argc, char** argv)
                 channelsFromFlag = true;
             }
             else if (arg == "--chunk")
-            {
                 cfg.chunkPoints = static_cast<std::size_t>(std::stoull(needValue("--chunk")));
-                chunkFromFlag = true;
-            }
             else if (arg == "--format")
             {
                 const std::string v = asciiUpper(needValue("--format"));
@@ -1276,11 +1284,6 @@ DownloadConfig parseArgs(int argc, char** argv)
         cfg.channels = {"CHAN1", "CHAN2", "CHAN3", "CHAN4"};
     }
 
-    // WORD doubles the bytes on the wire. Some firmware caps a single :WAV:DATA?
-    // read, so halve the default request size unless the user set one.
-    if (cfg.waveFormat == WaveFormat::Word && !chunkFromFlag)
-        cfg.chunkPoints = 125'000;
-
     dedupeChannels(cfg.channels);
     sortChannelsByNumber(cfg.channels);
     validateChannels(cfg.channels);
@@ -1305,8 +1308,7 @@ void printUsage(const char* program)
         << "                       byte = 8-bit, discards the low 4 bits of every sample\n"
         << "  --byte               Shorthand for --format byte\n"
         << "  --word-order O       WORD byte order: auto, le, be (default: auto)\n"
-        << "  --chunk N            Samples per :WAV:DATA? request\n"
-        << "                       (default: 250000 for byte, 125000 for word)\n"
+        << "  --chunk N            Samples per :WAV:DATA? request (default: 250000)\n"
         << "  --decimate N         Decimated CSV rows (default: 10000)\n"
         << "  --clip-tolerance PCT Clipping allowed before warning, in percent of samples\n"
         << "                       (default: 0.5). Under ~0.3 % the error stays below\n"
@@ -1318,6 +1320,7 @@ void printUsage(const char* program)
         << "  --csv                Also write per-channel full-depth CSVs (_CHAN1.csv)\n"
         << "  --no-raw             Skip per-channel int16 .bin + .json (independent of --csv)\n"
         << "  --no-aligned         Skip time-aligned multi-channel CSV\n"
+        << "                       (already skipped when only one channel is downloaded)\n"
         << "  --xzDecimated        Compress _decimated.csv with xz -6 (after analysis/plots)\n"
         << "  --no-plots           Skip verification PNGs\n"
         << "  --no-screenshot      Skip display screenshot\n"
