@@ -31,6 +31,8 @@ namespace
 
 constexpr int kTimeoutSec = 180;
 constexpr int kRecvBufSize = 1024 * 1024;
+// WORD codes span 0..65535. Stored int16 is code - kCodeBias so np.int16 can hold them.
+constexpr int kCodeBias = 32768;
 
 [[nodiscard]] std::string trim(std::string_view sv)
 {
@@ -270,7 +272,8 @@ private:
     return static_cast<int>(std::stod(raw));
 }
 
-void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double resetPauseSec)
+void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double resetPauseSec,
+                       WaveFormat format)
 {
     scope.writeCmd(":WAV:MODE NORMal");
     scope.drainErrors("WAV:MODE NORMal (reset)", true);
@@ -283,12 +286,70 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
 
     scope.writeCmd(":WAV:MODE RAW");
     scope.drainErrors("WAV:MODE RAW");
-    scope.writeCmd(":WAV:FORM BYTE");
-    scope.drainErrors("WAV:FORM BYTE");
+    const std::string formatWord = (format == WaveFormat::Word) ? "WORD" : "BYTE";
+    scope.writeCmd(":WAV:FORM " + formatWord);
+    scope.drainErrors("WAV:FORM " + formatWord);
+
+    // Confirm the scope accepted it. Firmware that does not know WORD silently stays
+    // on BYTE, and the sample count check below would then fail with a confusing
+    // message instead of naming the real cause.
+    const std::string activeFormat = asciiUpper(trim(scope.query(":WAV:FORM?")));
+    if (activeFormat.rfind(formatWord.substr(0, 4), 0) != 0)
+    {
+        throw std::runtime_error(
+            channel + ": requested :WAV:FORM " + formatWord + " but the scope reports "
+            + activeFormat + ". Use --format byte if this firmware cannot do WORD.");
+    }
 
     std::this_thread::sleep_for(
         std::chrono::duration<double>(resetPauseSec));
     scope.drainErrors("post-reset " + channel, true);
+}
+
+// Reassemble one sample from the transfer buffer.
+[[nodiscard]] inline unsigned decodeSample(
+    const std::uint8_t* p, WaveFormat format, WordOrder order)
+{
+    if (format == WaveFormat::Byte)
+        return p[0];
+    return (order == WordOrder::Big)
+               ? static_cast<unsigned>((p[0] << 8) | p[1])
+               : static_cast<unsigned>(p[0] | (p[1] << 8));
+}
+
+// Decide the WORD byte order from real data.
+//
+// A code-range test does not work here: the DHO900 spreads its 12-bit sample across
+// the whole 0..65535 word, so both orders stay "in range". What does separate them is
+// continuity. A digitized waveform is smooth sample to sample; swapping the bytes
+// scrambles the high and low halves and turns it into noise, which inflates the total
+// variation by orders of magnitude. Pick the order that yields the smoother record.
+[[nodiscard]] WordOrder detectWordOrder(const std::vector<std::uint8_t>& raw)
+{
+    auto totalVariation = [&](WordOrder o) {
+        double acc = 0.0;
+        unsigned prev = decodeSample(raw.data(), WaveFormat::Word, o);
+        for (std::size_t i = 2; i + 1 < raw.size(); i += 2)
+        {
+            const unsigned cur = decodeSample(raw.data() + i, WaveFormat::Word, o);
+            acc += std::fabs(static_cast<double>(cur) - static_cast<double>(prev));
+            prev = cur;
+        }
+        return acc;
+    };
+
+    if (raw.size() < 64)
+        return WordOrder::Little;
+
+    const double le = totalVariation(WordOrder::Little);
+    const double be = totalVariation(WordOrder::Big);
+
+    if (le <= be)
+        return WordOrder::Little;
+
+    std::cout << "  Note: big endian gives a " << (le / std::max(be, 1.0))
+              << "x smoother record, so the transfer is big endian.\n";
+    return WordOrder::Big;
 }
 
 [[nodiscard]] Waveform readChannelRaw(
@@ -296,9 +357,12 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
     const std::string& channel,
     int memoryDepth,
     std::size_t chunkPoints,
-    double resetPauseSec)
+    double resetPauseSec,
+    WaveFormat format,
+    WordOrder wordOrder,
+    double clipTolerancePercent)
 {
-    resetWavSubsystem(scope, channel, resetPauseSec);
+    resetWavSubsystem(scope, channel, resetPauseSec, format);
 
     scope.writeCmd(":WAV:POIN " + std::to_string(memoryDepth));
     scope.drainErrors("WAV:POIN " + std::to_string(memoryDepth) + " " + channel, true);
@@ -335,9 +399,32 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
     wf.xorig = xorig;
     wf.xref = xref;
     wf.values.reserve(static_cast<std::size_t>(points));
+    wf.raw.reserve(static_cast<std::size_t>(points));
+    wf.format = format;
+    wf.yinc = yinc;
+    wf.yorig = yorig;
+    wf.yref = yref;
+    wf.scale = yinc;
+    wf.offset = (static_cast<double>(kCodeBias) - yref - yorig) * yinc;
+    wf.bits = (format == WaveFormat::Word) ? 16 : 8;
+    std::vector<std::uint16_t> codes;
+    codes.reserve(static_cast<std::size_t>(points));
+    // The DHO900 uses the full 16-bit word for WORD transfers; the 12 real bits are
+    // scaled across it rather than right-aligned, so the rail is 65535 and not 4095.
+    wf.codeFull = (format == WaveFormat::Word) ? 65535u : 255u;
+    wf.codeMin = wf.codeFull;
+    wf.codeMax = 0;
 
+    // The preamble is read AFTER :WAV:FORM, so yinc and yref already describe the
+    // format in use. The conversion below therefore needs no extra rescaling; only
+    // the unpack width changes between BYTE and WORD.
     const double yScale = yinc;
     const double yOff = yref + yorig;
+
+    std::size_t railCount = 0;
+    const std::size_t bytesPerPoint = (format == WaveFormat::Word) ? 2u : 1u;
+    WordOrder order = (wordOrder == WordOrder::Auto) ? WordOrder::Little : wordOrder;
+    bool orderResolved = (format == WaveFormat::Byte) || (wordOrder != WordOrder::Auto);
 
     int start = 1;
     while (start <= points)
@@ -350,19 +437,39 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
         const auto raw = scope.queryBinaryBlock(":WAV:DATA?");
         scope.drainErrors("WAV:DATA? " + channel + " " + std::to_string(start) + ".." + std::to_string(stop));
 
-        const std::size_t expected = static_cast<std::size_t>(stop - start + 1);
-        if (raw.size() != expected)
+        const std::size_t expectedPoints = static_cast<std::size_t>(stop - start + 1);
+        const std::size_t expectedBytes = expectedPoints * bytesPerPoint;
+        if (raw.size() != expectedBytes)
         {
             throw std::runtime_error(
-                channel + ": expected " + std::to_string(expected) + " samples for "
-                + std::to_string(start) + ".." + std::to_string(stop) + ", got "
+                channel + ": expected " + std::to_string(expectedBytes) + " bytes ("
+                + std::to_string(expectedPoints) + " points x " + std::to_string(bytesPerPoint)
+                + ") for " + std::to_string(start) + ".." + std::to_string(stop) + ", got "
                 + std::to_string(raw.size()));
         }
 
+        if (!orderResolved)
+        {
+            order = detectWordOrder(raw);
+            orderResolved = true;
+            std::cout << "  " << channel << ": WORD byte order detected as "
+                      << toString(order) << "\n";
+        }
+
         const std::size_t base = wf.values.size();
-        wf.values.resize(base + raw.size());
-        for (std::size_t i = 0; i < raw.size(); ++i)
-            wf.values[base + i] = (static_cast<double>(raw[i]) - yOff) * yScale;
+        wf.values.resize(base + expectedPoints);
+        for (std::size_t i = 0; i < expectedPoints; ++i)
+        {
+            const unsigned code = decodeSample(raw.data() + i * bytesPerPoint, format, order);
+            wf.codeMin = std::min(wf.codeMin, code);
+            wf.codeMax = std::max(wf.codeMax, code);
+            codes.push_back(static_cast<std::uint16_t>(code));
+            if (code == 0 || code >= wf.codeFull)
+                ++railCount;
+            wf.raw.push_back(static_cast<std::int16_t>(
+                static_cast<int>(code) - kCodeBias));
+            wf.values[base + i] = (static_cast<double>(code) - yOff) * yScale;
+        }
 
         std::cout << "  " << channel << ": read " << start << ".." << stop << " / " << points << "\n"
                   << std::flush;
@@ -370,6 +477,66 @@ void resetWavSubsystem(TcpScpiSession& scope, const std::string& channel, double
     }
 
     wf.points = wf.values.size();
+    wf.resolvedOrder = order;
+    wf.clipped = (wf.codeMax >= wf.codeFull) || (wf.codeMin == 0);
+    wf.clippedPercent = wf.points ? 100.0 * static_cast<double>(railCount)
+                                        / static_cast<double>(wf.points)
+                                  : 0.0;
+
+    // Measure the smallest real step instead of trusting the container width. The
+    // word is 16 bits wide but only about 12 of them carry information.
+    {
+        std::sort(codes.begin(), codes.end());
+        codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
+        unsigned quantum = 0;
+        for (std::size_t i = 1; i < codes.size(); ++i)
+        {
+            const unsigned step = static_cast<unsigned>(codes[i] - codes[i - 1]);
+            if (step > 0 && (quantum == 0 || step < quantum))
+                quantum = step;
+        }
+        wf.codeQuantum = quantum;
+        wf.effectiveLsbVolts = quantum * yinc;
+        wf.effectiveBits = (quantum > 0 && wf.codeFull > 0)
+                               ? std::log2(static_cast<double>(wf.codeFull + 1)
+                                           / static_cast<double>(quantum))
+                               : 0.0;
+    }
+
+    std::cout << channel << ": " << toString(format)
+              << ", codes " << wf.codeMin << ".." << wf.codeMax << " of 0.." << wf.codeFull
+              << ", word LSB " << (yinc * 1e3) << " mV\n"
+              << "  " << channel << ": smallest real step " << wf.codeQuantum
+              << " counts = " << (wf.effectiveLsbVolts * 1e3) << " mV -> "
+              << wf.effectiveBits << " effective bits";
+    if (wf.clipped)
+        std::cout << ", " << wf.clippedPercent << " % of samples on a rail";
+    std::cout << "\n";
+
+    if (wf.clipped && wf.clippedPercent > clipTolerancePercent)
+    {
+        std::cout << "  WARNING: " << channel << " clips on " << wf.clippedPercent
+                  << " % of samples, above the " << clipTolerancePercent
+                  << " % tolerance.\n"
+                     "           Clipped peaks are wrong. On real captures the cost stays "
+                     "under 0.1 dB in\n"
+                     "           every band up to about 0.3 % clipping, then grows quickly: "
+                     "1 % already\n"
+                     "           costs 2.3 dB in the 200-800 kHz band. Raise V/div or pass "
+                     "--clip-tolerance.\n"
+                     "           Note WORD does not help here: clipping is the vertical "
+                     "window, not bit depth.\n";
+    }
+        else if (wf.codeFull > 0 &&
+             (wf.codeMax - wf.codeMin) < wf.codeFull / 4)
+    {
+        std::cout << "  Note: " << channel << " uses only "
+                  << (100.0 * static_cast<double>(wf.codeMax - wf.codeMin)
+                      / static_cast<double>(wf.codeFull))
+                  << " % of the code range. Reducing V/div would lower the "
+                     "quantization floor.\n";
+    }
+
     return wf;
 }
 
@@ -434,6 +601,80 @@ void flushBuffer(std::ofstream& out, std::string& buf, std::size_t flushAt = 2 *
         out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
         buf.clear();
     }
+}
+
+void appendInt16LE(std::string& buf, std::int16_t v)
+{
+    const auto u = static_cast<std::uint16_t>(v);
+    buf.push_back(static_cast<char>(u & 0xFF));
+    buf.push_back(static_cast<char>((u >> 8) & 0xFF));
+}
+
+void saveChannelSidecar(
+    const Waveform& wf,
+    const std::string& prefix,
+    const std::filesystem::path& outDir)
+{
+    const auto path = outDir / (prefix + "_" + wf.channel + ".json");
+    std::ofstream out(path);
+    if (!out)
+        throw std::runtime_error("Cannot open " + path.string());
+
+    const double t0 = wf.xorig - wf.xref * wf.xinc;
+    const double dt = wf.xinc;
+
+    auto num = [](double v) {
+        char tmp[64];
+        const int n = std::snprintf(tmp, sizeof(tmp), "%.17g", v);
+        if (n > 0)
+            return std::string(tmp, static_cast<std::size_t>(n));
+        return std::string("0");
+    };
+
+    out << "{\n"
+        << "  \"channel\": \"" << wf.channel << "\",\n"
+        << "  \"points\": " << wf.points << ",\n"
+        << "  \"dtype\": \"int16\",\n"
+        << "  \"endian\": \"little\",\n"
+        << "  \"code_bias\": " << kCodeBias << ",\n"
+        << "  \"t0\": " << num(t0) << ",\n"
+        << "  \"dt\": " << num(dt) << ",\n"
+        << "  \"scale\": " << num(wf.scale) << ",\n"
+        << "  \"offset\": " << num(wf.offset) << ",\n"
+        << "  \"formula\": \"v = raw * scale + offset\",\n"
+        << "  \"units\": { \"t\": \"s\", \"v\": \"V\" }\n"
+        << "}\n";
+
+    if (!out)
+        throw std::runtime_error("Failed writing " + path.string());
+    std::cout << "Saved " << path << "\n";
+}
+
+void saveSingleChannelBin(
+    const Waveform& wf,
+    const std::string& prefix,
+    const std::filesystem::path& outDir)
+{
+    const auto path = outDir / (prefix + "_" + wf.channel + ".bin");
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+        throw std::runtime_error("Cannot open " + path.string());
+
+    std::string buf;
+    buf.reserve(2 * 1024 * 1024);
+    for (const std::int16_t s : wf.raw)
+    {
+        appendInt16LE(buf, s);
+        flushBuffer(out, buf);
+    }
+
+    if (!buf.empty())
+        out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+
+    if (!out)
+        throw std::runtime_error("Failed writing " + path.string());
+    std::cout << "Saved " << path << "  (" << wf.raw.size() << " samples, "
+              << (wf.raw.size() * 2) << " bytes)\n";
 }
 
 void saveSingleChannelCsv(
@@ -827,11 +1068,17 @@ DownloadResult runDownload(const DownloadConfig& config)
     result.memoryDepth = acquireMemoryDepth(scope);
     scope.drainErrors("ACQ:MDEP");
     std::cout << "Memory depth (points): " << result.memoryDepth << "\n";
+    std::cout << "Transfer format: " << toString(config.waveFormat)
+              << (config.waveFormat == WaveFormat::Word
+                      ? " (12-bit, 2 bytes per point)"
+                      : " (8-bit, 1 byte per point)")
+              << "\n";
 
     for (const auto& ch : config.channels)
     {
         auto wf = readChannelRaw(
-            scope, ch, result.memoryDepth, config.chunkPoints, config.resetPauseSec);
+            scope, ch, result.memoryDepth, config.chunkPoints, config.resetPauseSec,
+            config.waveFormat, config.wordOrder, config.clipTolerancePercent);
         result.waveforms.push_back(std::move(wf));
     }
 
@@ -857,6 +1104,15 @@ DownloadResult runDownload(const DownloadConfig& config)
             std::cerr << "WARNING: " << wf.channel << " may be truncated ("
                       << wf.points << " vs memory depth " << result.memoryDepth
                       << "). Try increasing --reset-pause.\n";
+        }
+    }
+
+    if (config.saveRawBin)
+    {
+        for (const auto& wf : result.waveforms)
+        {
+            saveSingleChannelBin(wf, config.outPrefix, result.outDir);
+            saveChannelSidecar(wf, config.outPrefix, result.outDir);
         }
     }
 
@@ -895,10 +1151,29 @@ DownloadResult runDownload(const DownloadConfig& config)
     return result;
 }
 
+const char* toString(WaveFormat f)
+{
+    return f == WaveFormat::Word ? "WORD" : "BYTE";
+}
+
+const char* toString(WordOrder o)
+{
+    switch (o)
+    {
+    case WordOrder::Little:
+        return "little endian";
+    case WordOrder::Big:
+        return "big endian";
+    default:
+        return "auto";
+    }
+}
+
 DownloadConfig parseArgs(int argc, char** argv)
 {
     DownloadConfig cfg;
     bool channelsFromFlag = false;
+    bool chunkFromFlag = false;
     std::vector<std::string> positionalChannels;
 
     for (int i = 1; i < argc; ++i)
@@ -924,17 +1199,48 @@ DownloadConfig parseArgs(int argc, char** argv)
                 channelsFromFlag = true;
             }
             else if (arg == "--chunk")
+            {
                 cfg.chunkPoints = static_cast<std::size_t>(std::stoull(needValue("--chunk")));
+                chunkFromFlag = true;
+            }
+            else if (arg == "--format")
+            {
+                const std::string v = asciiUpper(needValue("--format"));
+                if (v == "WORD" || v == "12" || v == "16")
+                    cfg.waveFormat = WaveFormat::Word;
+                else if (v == "BYTE" || v == "8")
+                    cfg.waveFormat = WaveFormat::Byte;
+                else
+                    throw std::runtime_error("--format expects byte or word, got: " + v);
+            }
+            else if (arg == "--byte" || arg == "--8bit")
+                cfg.waveFormat = WaveFormat::Byte;
+            else if (arg == "--word-order")
+            {
+                const std::string v = asciiUpper(needValue("--word-order"));
+                if (v == "AUTO")
+                    cfg.wordOrder = WordOrder::Auto;
+                else if (v == "LE" || v == "LITTLE")
+                    cfg.wordOrder = WordOrder::Little;
+                else if (v == "BE" || v == "BIG")
+                    cfg.wordOrder = WordOrder::Big;
+                else
+                    throw std::runtime_error("--word-order expects auto, le or be, got: " + v);
+            }
             else if (arg == "--decimate")
                 cfg.outputPoints = static_cast<std::size_t>(std::stoull(needValue("--decimate")));
+            else if (arg == "--clip-tolerance")
+                cfg.clipTolerancePercent = std::stod(needValue("--clip-tolerance"));
             else if (arg == "--reset-pause")
                 cfg.resetPauseSec = std::stod(needValue("--reset-pause"));
             else if (arg == "--out-prefix")
                 cfg.outPrefix = needValue("--out-prefix");
             else if (arg == "--out-dir-prefix")
                 cfg.outDirPrefix = needValue("--out-dir-prefix");
+            else if (arg == "--csv")
+                cfg.saveRawCsv = true;
             else if (arg == "--no-raw")
-                cfg.saveRawCsv = false;
+                cfg.saveRawBin = false;
             else if (arg == "--no-aligned")
                 cfg.saveAlignedCsv = false;
             else if (arg == "--xzDecimated")
@@ -970,6 +1276,11 @@ DownloadConfig parseArgs(int argc, char** argv)
         cfg.channels = {"CHAN1", "CHAN2", "CHAN3", "CHAN4"};
     }
 
+    // WORD doubles the bytes on the wire. Some firmware caps a single :WAV:DATA?
+    // read, so halve the default request size unless the user set one.
+    if (cfg.waveFormat == WaveFormat::Word && !chunkFromFlag)
+        cfg.chunkPoints = 125'000;
+
     dedupeChannels(cfg.channels);
     sortChannelsByNumber(cfg.channels);
     validateChannels(cfg.channels);
@@ -989,12 +1300,23 @@ void printUsage(const char* program)
         << "Options:\n"
         << "  --ip ADDR            Scope IP (default: 192.168.1.162)\n"
         << "  --port PORT          SCPI TCP port (default: 5555)\n"
-        << "  --chunk N            Samples per :WAV:DATA? request (default: 250000)\n"
+        << "  --format byte|word   Transfer width (default: word)\n"
+        << "                       word = 12-bit, the full resolution of the digitizer\n"
+        << "                       byte = 8-bit, discards the low 4 bits of every sample\n"
+        << "  --byte               Shorthand for --format byte\n"
+        << "  --word-order O       WORD byte order: auto, le, be (default: auto)\n"
+        << "  --chunk N            Samples per :WAV:DATA? request\n"
+        << "                       (default: 250000 for byte, 125000 for word)\n"
         << "  --decimate N         Decimated CSV rows (default: 10000)\n"
+        << "  --clip-tolerance PCT Clipping allowed before warning, in percent of samples\n"
+        << "                       (default: 0.5). Under ~0.3 % the error stays below\n"
+        << "                       0.1 dB in every band, so filling the window is usually\n"
+        << "                       the better trade. Use 0 to flag any clipping at all.\n"
         << "  --reset-pause SEC    Pause between channel reads (default: 0.5)\n"
-        << "  --out-prefix PREFIX  Output file prefix (default: empty -> _CHAN1.csv)\n"
+        << "  --out-prefix PREFIX  Output file prefix (default: empty -> _CHAN1.bin)\n"
         << "  --out-dir-prefix P   Output folder prefix (default: aq_)\n"
-        << "  --no-raw             Skip per-channel full-depth CSVs\n"
+        << "  --csv                Also write per-channel full-depth CSVs (_CHAN1.csv)\n"
+        << "  --no-raw             Skip per-channel int16 .bin + .json (independent of --csv)\n"
         << "  --no-aligned         Skip time-aligned multi-channel CSV\n"
         << "  --xzDecimated        Compress _decimated.csv with xz -6 (after analysis/plots)\n"
         << "  --no-plots           Skip verification PNGs\n"
